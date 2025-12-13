@@ -131,15 +131,18 @@ export default function KuCoinStrategyScreener() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
 
-      const list = Array.isArray(json.signals) ? json.signals : [];
-      setSignals(list);
+// 允許後端回 {signals: [...] } 或直接回 [...]
+const list = Array.isArray(json) ? json : Array.isArray(json?.signals) ? json.signals : [];
+setSignals(list);
 
-      const errs = Array.isArray(json.errors) ? json.errors : [];
-      setBackendErrors(errs);
+// errors 保底
+const errs = Array.isArray(json?.errors) ? json.errors : [];
+setBackendErrors(errs);
 
-      setLastUpdated(
-        json.generatedAt ? new Date(json.generatedAt).toLocaleString() : new Date().toLocaleString()
-      );
+setLastUpdated(
+  json?.generatedAt ? new Date(json.generatedAt).toLocaleString() : new Date().toLocaleString()
+);
+
 
       updateSimPositionsWithSignals(list);
 
