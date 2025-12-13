@@ -1,6 +1,11 @@
 // frontend/src/KuCoinStrategyScreener.jsx
 
-import React, { useEffect, useMemo, useState } from "react";
+const API_BASE =
+  process.env.NODE_ENV === "production"
+    ? "https://kucoin-screener-backend.onrender.com"
+    : "http://localhost:4000";
+
+
 
 const API_BASE =
   process.env.NODE_ENV === "production"
