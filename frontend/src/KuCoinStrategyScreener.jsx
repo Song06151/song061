@@ -2,7 +2,11 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 
-const API_BASE = "http://localhost:4000";
+const API_BASE =
+  process.env.NODE_ENV === "production"
+    ? "https://你的後端.onrender.com"
+    : "http://localhost:4000";
+
 
 // 前端過濾用（不影響後端實際抓哪些週期）
 const TIMEFRAME_FILTERS = [
