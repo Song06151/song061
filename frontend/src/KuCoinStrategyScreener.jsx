@@ -50,7 +50,7 @@ export default function KuCoinStrategyScreener() {
   const [selectedSignal, setSelectedSignal] = useState(null);
 
   // 讀取後端
-  const loadScreener = async () => {
+  const res = await fetch(`${API_BASE}/api/screener`);
     try {
       setFetchError(null);
 
