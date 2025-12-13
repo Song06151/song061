@@ -7,7 +7,7 @@ import "./App.css";
  * - production: Render backend
  */
 const API_BASE =
-  process.env.NODE_ENV === "production"
+    process.env.REACT_APP_API_BASE || "http://localhost:4000";
     ? "https://kucoin-screener-backend.onrender.com"
     : "http://localhost:4000";
 
