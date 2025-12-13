@@ -5,8 +5,6 @@ const API_BASE =
     ? "https://kucoin-screener-backend.onrender.com"
     : "http://localhost:4000";
 
-
-
 const API_BASE =
   process.env.NODE_ENV === "production"
     ? "https://你的後端.onrender.com"
@@ -129,7 +127,7 @@ export default function KuCoinStrategyScreener() {
     setIsLoading(true);
     setFetchError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/screener`);
+      const res = await fetch(`${API_BASE}/api/screener`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
 
