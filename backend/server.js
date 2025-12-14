@@ -1017,6 +1017,7 @@ app.get("/api/backtest", async (req, res) => {
 
 // ---------- 啟動伺服器 ----------
 
+app.get("/", (req, res) => res.status(200).send("OK"));
 app.listen(PORT, () => {
   console.log("🚀 server.js 已載入（勝率優先：1h confirm + 6h filter + 回測）");
   console.log(`✅ KuCoin Proxy + Screener 運行中: http://localhost:${PORT}`);
