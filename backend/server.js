@@ -16,7 +16,7 @@ const cors = require("cors");
 const fetch = require("node-fetch"); // v2
 
 const app = express();
-const PORT = precess.env.PORT||4000；
+const PORT = process.env.PORT || 4000;
 const KUCOIN_API_BASE = "https://api.kucoin.com/api/v1";
 
 app.use(
