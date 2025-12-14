@@ -1,11 +1,11 @@
 // server.js
-// KuCoin Proxy + Screener（30m & 1h）+ Backtest
+// KuCoin Proxy + 高勝率 Screener（1h 進場 + 6h 同向確認）+ 回測模擬單
 //
 // 提供：
 //   GET /api/kucoin/candles
 //   GET /api/kucoin/ticker
-//   GET /api/screener
-//   GET /api/backtest
+//   GET /api/screener   （勝率優先：1h confirm + 6h filter，多空訊號）
+//   GET /api/backtest   （單幣種回測模擬單）
 //
 // 使用前：
 //   npm init -y
@@ -16,13 +16,8 @@ const cors = require("cors");
 const fetch = require("node-fetch"); // v2
 
 const app = express();
-const PORT = process.env.PORT || 4000;
-
+const PORT = 4000;
 const KUCOIN_API_BASE = "https://api.kucoin.com/api/v1";
-const KUCOIN_API_V2 = "https://api.kucoin.com/api/v2";
-
-// CoinGecko（免費公開 API，無需 key）
-const COINGECKO_BASE = "https://api.coingecko.com/api/v3";
 
 app.use(
   cors({
@@ -106,7 +101,7 @@ function calculateMACD(values, fast = 12, slow = 26, signal = 9) {
 
   const lastIdx = macdLine.length - 1;
   const prevIdx = lastIdx - 1;
-  if (signalSeries[lastIdx] === undefined || signalSeries[prevIdx] === undefined) return null;
+  if (!signalSeries[lastIdx] || !signalSeries[prevIdx]) return null;
 
   const macd = macdLine[lastIdx];
   const sigLast = signalSeries[lastIdx];
@@ -121,6 +116,8 @@ function calculateMACD(values, fast = 12, slow = 26, signal = 9) {
     signal: sigLast,
     hist,
     histPrev,
+    macdPrev,
+    signalPrev: sigPrev,
   };
 }
 
@@ -185,6 +182,18 @@ function detectStructureBias(closes) {
   return "neutral";
 }
 
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
+}
+
+// 依強度建議持倉方案（1h～24h）
+function suggestHoldProfile(strength) {
+  if (strength >= 5) return { key: "12-24", minH: 12, maxH: 24, label: "長波 12–24 小時" };
+  if (strength >= 4) return { key: "8-12", minH: 8, maxH: 12, label: "波段 8–12 小時" };
+  if (strength >= 3) return { key: "4-8", minH: 4, maxH: 8, label: "短波 4–8 小時" };
+  return { key: "1-4", minH: 1, maxH: 4, label: "超短 1–4 小時" };
+}
+
 // ---------- KuCoin API 封裝 ----------
 
 async function fetchKuCoinCandles(symbol, type, limit = 200) {
@@ -215,168 +224,6 @@ async function fetchKuCoinTicker(symbol) {
     price: parseFloat(json.data.price),
   };
 }
-
-// KuCoin symbols（v2）
-async function fetchKuCoinSymbolsV2() {
-  const url = `${KUCOIN_API_V2}/symbols`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`KuCoin symbols HTTP ${res.status}`);
-  const json = await res.json();
-  if (json.code !== "200000" || !Array.isArray(json.data)) {
-    throw new Error(`KuCoin symbols 回傳錯誤: ${json.code} ${json.msg || ""}`);
-  }
-  return json.data;
-}
-
-// ---------- Universe：挑選「成交量前 80（可在 KuCoin 交易的 USDT 幣對）」 ----------
-
-const UNIVERSE_CACHE = {
-  symbols: null, // ["BTC-USDT", ...]
-  fetchedAt: 0,
-  source: null,
-  notes: null,
-};
-
-// 這個快取時間你可調（建議別太短，否則 /api/screener 會太重）
-const UNIVERSE_TTL_MS = 6 * 60 * 60 * 1000; // 6 小時
-
-async function fetchCoinGeckoTopSymbolsByVolume(limit = 120) {
-  // 用 CoinGecko 的 markets volume_desc（以目前 24h total_volume 排序）
-  // 無法直接取得「30 天常駐」排行，所以採用：成交量排序 + 快取，盡量貼近你要的結果。
-  const perPage = 250;
-  const url = `${COINGECKO_BASE}/coins/markets?vs_currency=usd&order=volume_desc&per_page=${perPage}&page=1&sparkline=false`;
-  const res = await fetch(url, { headers: { "accept": "application/json" } });
-  if (!res.ok) throw new Error(`CoinGecko markets HTTP ${res.status}`);
-  const arr = await res.json();
-  if (!Array.isArray(arr)) throw new Error("CoinGecko markets 格式不正確");
-
-  const out = [];
-  const seen = new Set();
-  for (const item of arr) {
-    const sym = (item?.symbol || "").toString().trim().toUpperCase();
-    if (!sym) continue;
-    if (seen.has(sym)) continue;
-    seen.add(sym);
-    out.push(sym);
-    if (out.length >= limit) break;
-  }
-  return out;
-}
-
-async function buildUniverseTop80() {
-  // 1) KuCoin 全部 symbols -> 找出可交易 USDT
-  const all = await fetchKuCoinSymbolsV2();
-  const usdtSymbols = all
-    .filter((x) => x && x.quoteCurrency === "USDT" && (x.enableTrading === true || x.enableTrading === "true"))
-    .map((x) => ({
-      symbol: x.symbol, // e.g. "BTC-USDT"
-      base: (x.baseCurrency || "").toUpperCase(),
-    }))
-    .filter((x) => x.symbol && x.base);
-
-  const baseToSymbol = new Map();
-  for (const x of usdtSymbols) {
-    // 只取第一個（同 base 可能有多個版本，這裡先用最常見的）
-    if (!baseToSymbol.has(x.base)) baseToSymbol.set(x.base, x.symbol);
-  }
-
-  // 2) CoinGecko 成交量排序 symbols -> mapping 成 KuCoin 的 USDT 幣對
-  const cgSyms = await fetchCoinGeckoTopSymbolsByVolume(160);
-
-  const picked = [];
-  for (const s of cgSyms) {
-    const k = baseToSymbol.get(s);
-    if (!k) continue;
-    picked.push(k);
-    if (picked.length >= 80) break;
-  }
-
-  // 3) 若不足 80，補齊：從 KuCoin USDT 幣對裡面補（避免空）
-  if (picked.length < 80) {
-    const exists = new Set(picked);
-    for (const x of usdtSymbols) {
-      if (exists.has(x.symbol)) continue;
-      picked.push(x.symbol);
-      if (picked.length >= 80) break;
-    }
-  }
-
-  return {
-    symbols: picked,
-    source: "coingecko(volume_desc) + kucoin(usdt_pairs)",
-    notes: "以 CoinGecko 的成交量排序挑選可在 KuCoin 交易的 USDT 幣對；使用快取降低呼叫量。非嚴格『過去 30 天常駐』統計。",
-  };
-}
-
-async function getUniverseSymbols() {
-  const now = Date.now();
-  if (UNIVERSE_CACHE.symbols && now - UNIVERSE_CACHE.fetchedAt < UNIVERSE_TTL_MS) {
-    return UNIVERSE_CACHE;
-  }
-
-  try {
-    const built = await buildUniverseTop80();
-    UNIVERSE_CACHE.symbols = built.symbols;
-    UNIVERSE_CACHE.fetchedAt = now;
-    UNIVERSE_CACHE.source = built.source;
-    UNIVERSE_CACHE.notes = built.notes;
-    return UNIVERSE_CACHE;
-  } catch (err) {
-    // fallback：如果 CG 掛了或被限流，就用一個安全的較大列表（但不會到 80）
-    console.error("[Universe] build error:", err.message || String(err));
-
-    const fallback = [
-      "BTC-USDT",
-      "ETH-USDT",
-      "SOL-USDT",
-      "BNB-USDT",
-      "XRP-USDT",
-      "DOGE-USDT",
-      "ADA-USDT",
-      "AVAX-USDT",
-      "LINK-USDT",
-      "DOT-USDT",
-      "MATIC-USDT",
-      "LTC-USDT",
-      "BCH-USDT",
-      "TRX-USDT",
-      "ATOM-USDT",
-      "ETC-USDT",
-      "UNI-USDT",
-      "FIL-USDT",
-      "APT-USDT",
-      "ARB-USDT",
-      "OP-USDT",
-      "NEAR-USDT",
-      "INJ-USDT",
-      "SUI-USDT",
-      "SEI-USDT",
-      "TIA-USDT",
-    ];
-
-    UNIVERSE_CACHE.symbols = fallback;
-    UNIVERSE_CACHE.fetchedAt = now;
-    UNIVERSE_CACHE.source = "fallback(static)";
-    UNIVERSE_CACHE.notes = "CoinGecko 或 KuCoin symbols 取得失敗，暫用 fallback 清單。";
-    return UNIVERSE_CACHE;
-  }
-}
-
-// 給你 debug 用（可看目前挑了哪些）
-app.get("/api/universe", async (req, res) => {
-  try {
-    const uni = await getUniverseSymbols();
-    res.json({
-      count: uni.symbols?.length || 0,
-      fetchedAt: new Date(uni.fetchedAt).toISOString(),
-      source: uni.source,
-      notes: uni.notes,
-      symbols: uni.symbols || [],
-    });
-  } catch (err) {
-    res.status(500).json({ error: "universe error", detail: err.message || String(err) });
-  }
-});
 
 // ---------- 對外 API：candles / ticker ----------
 
@@ -416,392 +263,396 @@ app.get("/api/kucoin/ticker", async (req, res) => {
   }
 });
 
-// ---------- Screener 設定（30m & 1h） ----------
+// ---------- Screener 設定 ----------
+// 注意：你之前要「前 80 大」那條要做得精準會牽涉外部資料源（30d volume），這裡先維持可控的名單。
+// 你要我再把「自動抓 top80」補上，我可以下一版直接做（會加快取、避免 Render 超慢）。
 
-const TIMEFRAMES = [
-  { key: "30m", kucoinType: "30min" },
-  { key: "1h", kucoinType: "1hour" },
+const SYMBOLS = [
+  "BTC-USDT",
+  "ETH-USDT",
+  "BNB-USDT",
+  "SOL-USDT",
+  "XRP-USDT",
+  "DOGE-USDT",
+  "AVAX-USDT",
+  "LINK-USDT",
+  "ADA-USDT",
+  "TRX-USDT",
+  "TON-USDT",
+  "DOT-USDT",
+  "MATIC-USDT",
+  "LTC-USDT",
+  "BCH-USDT",
+  "ATOM-USDT",
+  "NEAR-USDT",
+  "APT-USDT",
+  "OP-USDT",
+  "ARB-USDT",
+  "SUI-USDT",
+  "INJ-USDT",
+  "FIL-USDT",
+  "ETC-USDT",
+  "ICP-USDT",
+  "UNI-USDT",
+  "AAVE-USDT",
+  "SNX-USDT",
+  "IMX-USDT",
+  "RNDR-USDT",
 ];
 
-// ---------- /api/screener：提前預判 + 確認 ----------
+// 你要的範圍：最少 1h、最多 24h。
+// 這版的「下單訊號」以 1h 觸發，並用 6h 做同向確認；另外保留可延伸的 timeframes 供 UI 顯示。
+const TIMEFRAMES = [
+  { key: "1h", kucoinType: "1hour" },
+  { key: "2h", kucoinType: "2hour" },
+  { key: "4h", kucoinType: "4hour" },
+  { key: "6h", kucoinType: "6hour" },
+  { key: "8h", kucoinType: "8hour" },
+  { key: "12h", kucoinType: "12hour" },
+  { key: "1d", kucoinType: "1day" },
+];
 
-// 避免你 auto refresh 太密打爆 KuCoin：做一層 cache（同一段時間直接回前一次結果）
-const SCREENER_CACHE = {
-  payload: null,
-  fetchedAt: 0,
-};
-const SCREENER_TTL_MS = 25 * 1000; // 25 秒
+// 主策略：以 1h 觸發，6h 過濾
+const ENTRY_TF = { key: "1h", kucoinType: "1hour" };
+const FILTER_TF = { key: "6h", kucoinType: "6hour" };
 
-// 很重要：控制同時間並發，否則 Render 會慢到爆或被對方限流
-async function withConcurrencyLimit(items, limit, worker) {
-  const ret = [];
-  let idx = 0;
+// 訊號數量目標（你要一天約 5 條）
+const MAX_SIGNALS = 5;
 
-  const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
-    while (idx < items.length) {
-      const cur = idx++;
-      try {
-        ret[cur] = await worker(items[cur], cur);
-      } catch (e) {
-        ret[cur] = { __error: e };
-      }
-    }
-  });
-
-  await Promise.all(runners);
-  return ret;
-}
+// ---------- /api/screener：勝率優先（1h confirm + 6h 同向確認） ----------
 
 app.get("/api/screener", async (req, res) => {
-  const now = Date.now();
-  if (SCREENER_CACHE.payload && now - SCREENER_CACHE.fetchedAt < SCREENER_TTL_MS) {
-    return res.json(SCREENER_CACHE.payload);
-  }
-
   const started = Date.now();
   const signals = [];
   const errors = [];
 
-  let universe;
-  try {
-    universe = await getUniverseSymbols();
-  } catch (err) {
-    universe = { symbols: [], source: "error", notes: err.message || String(err), fetchedAt: Date.now() };
-  }
-
-  const SYMBOLS = Array.isArray(universe.symbols) ? universe.symbols : [];
-  const maxSymbols = Math.max(1, Math.min(80, SYMBOLS.length));
-  const symbolsToScan = SYMBOLS.slice(0, maxSymbols);
-
-  // ticker：每個 symbol 只抓一次，供 30m/1h 共用
-  const tickerMap = new Map();
-  const tickerJobs = symbolsToScan.map((symbol) => symbol);
-
-  const tickerResults = await withConcurrencyLimit(tickerJobs, 6, async (symbol) => {
-    const t = await fetchKuCoinTicker(symbol);
-    return { symbol, price: t.price };
-  });
-
-  for (const r of tickerResults) {
-    if (r && r.symbol && typeof r.price === "number") {
-      tickerMap.set(r.symbol, r.price);
-    }
-  }
-
-  // candles jobs：symbol x timeframe
-  const jobs = [];
-  for (const symbol of symbolsToScan) {
-    for (const tf of TIMEFRAMES) {
-      jobs.push({ symbol, tf });
-    }
-  }
-
-  const results = await withConcurrencyLimit(jobs, 5, async ({ symbol, tf }) => {
-    const candles = await fetchKuCoinCandles(symbol, tf.kucoinType, 160);
-    return { symbol, tfKey: tf.key, candles };
-  });
-
-  for (const item of results) {
-    if (!item || item.__error) {
-      const msg = item?.__error?.message || String(item?.__error || "unknown");
-      errors.push({ source: "CANDLES", message: msg });
-      continue;
-    }
-
-    const { symbol, tfKey, candles } = item;
-
-    if (!candles || candles.length < 80) {
-      errors.push({
-        symbol,
-        timeframe: tfKey,
-        source: "CANDLES",
-        message: "K 線資料不足",
-      });
-      continue;
-    }
-
+  for (const symbol of SYMBOLS) {
     try {
-      const closes = candles.map((c) => c.close);
-      const volumes = candles.map((c) => c.volume);
-      const last = candles[candles.length - 1];
-      const prev = candles[candles.length - 2];
+      const [candles1h, candles6h, ticker] = await Promise.all([
+        fetchKuCoinCandles(symbol, ENTRY_TF.kucoinType, 220),
+        fetchKuCoinCandles(symbol, FILTER_TF.kucoinType, 220),
+        fetchKuCoinTicker(symbol),
+      ]);
 
-      const tickerPrice = tickerMap.get(symbol);
-      const price = typeof tickerPrice === "number" ? tickerPrice : last.close;
-      const prevClose = prev.close;
-
-      const ema20 = calculateEMA(closes, 20);
-      const rsi14 = calculateRSI(closes, 14);
-      const macd = calculateMACD(closes, 12, 26, 9);
-      const bb = calculateBBLast(closes, 20, 2);
-      const vwap = calculateVWAP(candles, 30);
-
-      const volMa20 = calculateSMA(volumes, 20);
-      const volMa5 = calculateSMA(volumes, 5);
-      const volCurrent = volumes[volumes.length - 1];
-
-      const volSpike = volMa20 ? volCurrent > volMa20 * 2.0 : false;
-      const volPulse = volMa5 && volMa20 ? volMa5 / volMa20 : 1;
-
-      const macdHist = macd ? macd.hist : null;
-      const macdHistPrev = macd ? macd.histPrev : null;
-
-      const macdUp =
-        macdHist != null &&
-        macdHistPrev != null &&
-        macdHist > macdHistPrev &&
-        macdHist >= 0;
-      const macdDown =
-        macdHist != null &&
-        macdHistPrev != null &&
-        macdHist < macdHistPrev &&
-        macdHist <= 0;
-
-      const bbExpandingUp =
-        bb && bb.widthPrev > 0 && bb.width > bb.widthPrev * 1.1 && price >= bb.middle;
-      const bbExpandingDown =
-        bb && bb.widthPrev > 0 && bb.width > bb.widthPrev * 1.1 && price <= bb.middle;
-
-      const priceAboveEma = ema20 && price > ema20;
-      const priceBelowEma = ema20 && price < ema20;
-
-      const trendUpShort = price > prevClose;
-      const trendDownShort = price < prevClose;
-
-      const rsiBull = rsi14 != null && rsi14 > 40 && rsi14 < 70;
-      const rsiBear = rsi14 != null && rsi14 > 30 && rsi14 < 60;
-
-      let vwapDevPct = null;
-      if (vwap) {
-        vwapDevPct = ((price - vwap) / vwap) * 100;
+      if (!candles1h || candles1h.length < 120) {
+        errors.push({ symbol, timeframe: "1h", source: "CANDLES", message: "1h K 線資料不足" });
+        continue;
       }
-
-      const structureBias = detectStructureBias(closes);
-
-      // 多頭條件：提前預判 + 確認
-      const earlyLongConds = {
-        volSpike,
-        volPulseStrong: volPulse > 1.5,
-        macdUp,
-        bbExpandingUp,
-        priceAboveEma,
-        trendUpShort,
-        rsiBull,
-        vwapNearOrBelow: vwapDevPct != null && vwapDevPct > -1.5 && vwapDevPct < 3.0,
-        structureBull: structureBias === "bullish",
-      };
-      const earlyLongScore = Object.values(earlyLongConds).filter(Boolean).length;
-
-      const confirmLongConds = {
-        priceAboveEma,
-        rsiBull,
-        macdUp,
-        bbExpandingUp,
-        trendUpShort,
-        volPulseGood: volPulse > 1.2,
-        vwapHealthy: vwapDevPct != null && vwapDevPct > -1.0 && vwapDevPct < 4.5,
-      };
-      const confirmLongScore = Object.values(confirmLongConds).filter(Boolean).length;
-
-      // 空頭條件：提前預判 + 確認
-      const earlyShortConds = {
-        volSpike,
-        volPulseStrong: volPulse > 1.5,
-        macdDown,
-        bbExpandingDown,
-        priceBelowEma,
-        trendDownShort,
-        rsiBear,
-        vwapNearOrAbove: vwapDevPct != null && vwapDevPct < 1.5 && vwapDevPct > -3.0,
-        structureBear: structureBias === "bearish",
-      };
-      const earlyShortScore = Object.values(earlyShortConds).filter(Boolean).length;
-
-      const confirmShortConds = {
-        priceBelowEma,
-        rsiBear,
-        macdDown,
-        bbExpandingDown,
-        trendDownShort,
-        volPulseGood: volPulse > 1.2,
-        vwapHealthy: vwapDevPct != null && vwapDevPct < 1.0 && vwapDevPct > -4.5,
-      };
-      const confirmShortScore = Object.values(confirmShortConds).filter(Boolean).length;
-
-      let side = null;
-      let stage = null; // "early" | "confirm"
-      let score = 0;
-      const scoreMax = 9;
-      let techSummary = [];
-
-      if (earlyLongScore >= 2 || confirmLongScore >= 3) {
-        side = "long";
-        if (confirmLongScore >= 3) {
-          stage = "confirm";
-          score = confirmLongScore;
-        } else {
-          stage = "early";
-          score = earlyLongScore;
-        }
-
-        techSummary = [
-          `${priceAboveEma ? "✅" : "❌"} 價格在 EMA20 上方`,
-          `${rsiBull ? "✅" : "❌"} RSI 處於多頭健康區（約 40~70）`,
-          `${macdUp ? "✅" : "❌"} MACD 動能正在往上或剛翻正`,
-          `${bbExpandingUp ? "✅" : "❌"} 布林帶往上擴張，波動率放大`,
-          `${volSpike ? "✅" : "❌"} 當前成交量顯著高於過去 20 根`,
-          `${volPulse > 1.5 ? "✅" : "❌"} 最近 5 根平均量 > 20 根平均量（量能脈衝）`,
-          `${
-            vwapDevPct != null && vwapDevPct > -1.5 && vwapDevPct < 3.0 ? "✅" : "❌"
-          } 價格相對 VWAP 在合理區間（偏多）`,
-          `${structureBias === "bullish" ? "✅" : "❌"} 收盤價結構偏多（高點或低點墊高）`,
-        ];
-      } else if (earlyShortScore >= 2 || confirmShortScore >= 3) {
-        side = "short";
-        if (confirmShortScore >= 3) {
-          stage = "confirm";
-          score = confirmShortScore;
-        } else {
-          stage = "early";
-          score = earlyShortScore;
-        }
-
-        techSummary = [
-          `${priceBelowEma ? "✅" : "❌"} 價格在 EMA20 下方`,
-          `${rsiBear ? "✅" : "❌"} RSI 處於偏弱區（約 30~60）`,
-          `${macdDown ? "✅" : "❌"} MACD 動能正在往下或剛翻負`,
-          `${bbExpandingDown ? "✅" : "❌"} 布林帶往下擴張，波動率放大`,
-          `${volSpike ? "✅" : "❌"} 當前成交量顯著高於過去 20 根`,
-          `${volPulse > 1.5 ? "✅" : "❌"} 最近 5 根平均量 > 20 根平均量（量能脈衝）`,
-          `${
-            vwapDevPct != null && vwapDevPct < 1.5 && vwapDevPct > -3.0 ? "✅" : "❌"
-          } 價格相對 VWAP 在合理區間（偏空）`,
-          `${structureBias === "bearish" ? "✅" : "❌"} 收盤價結構偏空（高點或低點走低）`,
-        ];
-      }
-
-      if (!side || !stage) {
+      if (!candles6h || candles6h.length < 120) {
+        errors.push({ symbol, timeframe: "6h", source: "CANDLES", message: "6h K 線資料不足" });
         continue;
       }
 
-      const strength = Math.max(1, Math.min(5, Math.round((score / scoreMax) * 5)));
+      // ===== 1h 指標 =====
+      const closes1h = candles1h.map((c) => c.close);
+      const volumes1h = candles1h.map((c) => c.volume);
+      const last1h = candles1h[candles1h.length - 1];
+      const prev1h = candles1h[candles1h.length - 2];
 
+      const price = ticker.price;
+      const prevClose = prev1h.close;
+
+      const ema20_1h = calculateEMA(closes1h, 20);
+      const ema20Prev_1h = calculateEMA(closes1h.slice(0, -1), 20);
+      const emaSlopeUp_1h = ema20_1h != null && ema20Prev_1h != null ? ema20_1h > ema20Prev_1h : false;
+      const emaSlopeDown_1h = ema20_1h != null && ema20Prev_1h != null ? ema20_1h < ema20Prev_1h : false;
+
+      const rsi14_1h = calculateRSI(closes1h, 14);
+      const rsiPrev_1h = calculateRSI(closes1h.slice(0, -1), 14);
+      const rsiUp_1h = rsi14_1h != null && rsiPrev_1h != null ? rsi14_1h > rsiPrev_1h : false;
+      const rsiDown_1h = rsi14_1h != null && rsiPrev_1h != null ? rsi14_1h < rsiPrev_1h : false;
+
+      const macd_1h = calculateMACD(closes1h, 12, 26, 9);
+      const bb_1h = calculateBBLast(closes1h, 20, 2);
+      const vwap_1h = calculateVWAP(candles1h, 30);
+
+      const volMa20_1h = calculateSMA(volumes1h, 20);
+      const volMa5_1h = calculateSMA(volumes1h, 5);
+      const volCurrent_1h = volumes1h[volumes1h.length - 1];
+
+      const volPulse_1h = volMa5_1h && volMa20_1h ? volMa5_1h / volMa20_1h : 1;
+
+      let vwapDevPct_1h = null;
+      if (vwap_1h) vwapDevPct_1h = ((price - vwap_1h) / vwap_1h) * 100;
+
+      const structureBias_1h = detectStructureBias(closes1h);
+
+      // ===== 6h 指標（同向確認）=====
+      const closes6h = candles6h.map((c) => c.close);
+      const volumes6h = candles6h.map((c) => c.volume);
+      const ema20_6h = calculateEMA(closes6h, 20);
+      const ema20Prev_6h = calculateEMA(closes6h.slice(0, -1), 20);
+      const emaSlopeUp_6h = ema20_6h != null && ema20Prev_6h != null ? ema20_6h > ema20Prev_6h : false;
+      const emaSlopeDown_6h = ema20_6h != null && ema20Prev_6h != null ? ema20_6h < ema20Prev_6h : false;
+      const rsi14_6h = calculateRSI(closes6h, 14);
+      const macd_6h = calculateMACD(closes6h, 12, 26, 9);
+      const structureBias_6h = detectStructureBias(closes6h);
+
+      // ===== 共同判斷 =====
+      const priceAboveEma_1h = ema20_1h != null ? price > ema20_1h : false;
+      const priceBelowEma_1h = ema20_1h != null ? price < ema20_1h : false;
+
+      const priceAboveEma_6h = ema20_6h != null ? price > ema20_6h : false;
+      const priceBelowEma_6h = ema20_6h != null ? price < ema20_6h : false;
+
+      // MACD 更嚴格：翻正/翻負 或 真的站上/站下
+      const hist_1h = macd_1h ? macd_1h.hist : null;
+      const histPrev_1h = macd_1h ? macd_1h.histPrev : null;
+      const macdLine_1h = macd_1h ? macd_1h.macd : null;
+      const signalLine_1h = macd_1h ? macd_1h.signal : null;
+
+      const macdFlipUp_1h = hist_1h != null && histPrev_1h != null && histPrev_1h < 0 && hist_1h > 0;
+      const macdFlipDown_1h = hist_1h != null && histPrev_1h != null && histPrev_1h > 0 && hist_1h < 0;
+
+      const macdUpStrong_1h =
+        macdLine_1h != null && signalLine_1h != null && macdLine_1h > signalLine_1h &&
+        hist_1h != null && histPrev_1h != null && hist_1h > histPrev_1h && hist_1h > 0;
+
+      const macdDownStrong_1h =
+        macdLine_1h != null && signalLine_1h != null && macdLine_1h < signalLine_1h &&
+        hist_1h != null && histPrev_1h != null && hist_1h < histPrev_1h && hist_1h < 0;
+
+      const macdOkLong_1h = macdFlipUp_1h || macdUpStrong_1h;
+      const macdOkShort_1h = macdFlipDown_1h || macdDownStrong_1h;
+
+      // BB 更嚴格：擴張幅度 + 波動門檻
+      const bbExpandUp_1h =
+        bb_1h &&
+        bb_1h.widthPrev > 0 &&
+        bb_1h.width > bb_1h.widthPrev * 1.15 &&
+        bb_1h.middle > 0 &&
+        (bb_1h.width / bb_1h.middle) > 0.02 &&
+        price >= bb_1h.middle;
+
+      const bbExpandDown_1h =
+        bb_1h &&
+        bb_1h.widthPrev > 0 &&
+        bb_1h.width > bb_1h.widthPrev * 1.15 &&
+        bb_1h.middle > 0 &&
+        (bb_1h.width / bb_1h.middle) > 0.02 &&
+        price <= bb_1h.middle;
+
+      // RSI 更挑（勝率取向）
+      const rsiBull_1h = rsi14_1h != null && rsi14_1h >= 55 && rsi14_1h <= 68 && rsiUp_1h;
+      const rsiBear_1h = rsi14_1h != null && rsi14_1h >= 32 && rsi14_1h <= 45 && rsiDown_1h;
+
+      // VWAP 過濾：不要追太遠（勝率取向）
+      const vwapLongOk_1h = vwapDevPct_1h != null && vwapDevPct_1h >= -0.5 && vwapDevPct_1h <= 2.5;
+      const vwapShortOk_1h = vwapDevPct_1h != null && vwapDevPct_1h <= 0.5 && vwapDevPct_1h >= -2.5;
+
+      // 量能：至少有脈衝（不要無量亂拉亂殺）
+      const volOk_1h = volPulse_1h > 1.3;
+
+      // 6h 同向確認：順勢 + 結構
+      const filterLong_6h =
+        priceAboveEma_6h && emaSlopeUp_6h &&
+        rsi14_6h != null && rsi14_6h > 52 &&
+        (structureBias_6h === "bullish");
+
+      const filterShort_6h =
+        priceBelowEma_6h && emaSlopeDown_6h &&
+        rsi14_6h != null && rsi14_6h < 48 &&
+        (structureBias_6h === "bearish");
+
+      // ===== 只輸出 confirm（勝率優先）=====
+      // 多頭 confirm：1h 必須都很乾淨 + 6h 同向
+      const confirmLongConds = {
+        filter6h: filterLong_6h,
+        priceAboveEma_1h,
+        emaSlopeUp_1h,
+        structureBull_1h: structureBias_1h === "bullish",
+        rsiBull_1h,
+        macdOkLong_1h,
+        bbExpandUp_1h,
+        volOk_1h,
+        vwapLongOk_1h,
+      };
+
+      // 空頭 confirm：1h 必須都很乾淨 + 6h 同向
+      const confirmShortConds = {
+        filter6h: filterShort_6h,
+        priceBelowEma_1h,
+        emaSlopeDown_1h,
+        structureBear_1h: structureBias_1h === "bearish",
+        rsiBear_1h,
+        macdOkShort_1h,
+        bbExpandDown_1h,
+        volOk_1h,
+        vwapShortOk_1h,
+      };
+
+      const confirmLongScore = Object.values(confirmLongConds).filter(Boolean).length;
+      const confirmShortScore = Object.values(confirmShortConds).filter(Boolean).length;
+
+      const scoreMax = 9;
+
+      // 你要勝率高：再加一道「至少 8/9」才放行（這會大幅壓低訊號數）
+      const PASS_SCORE = 8;
+
+      let side = null;
+      let score = 0;
+      let techSummary = [];
+
+      if (confirmLongScore >= PASS_SCORE) {
+        side = "long";
+        score = confirmLongScore;
+        techSummary = [
+          `${confirmLongConds.filter6h ? "✅" : "❌"} 6h 同向確認（趨勢 + 結構）`,
+          `${priceAboveEma_1h ? "✅" : "❌"} 1h 價格在 EMA20 上方`,
+          `${emaSlopeUp_1h ? "✅" : "❌"} 1h EMA20 上升（順勢）`,
+          `${structureBias_1h === "bullish" ? "✅" : "❌"} 1h 結構偏多（最近 5 根至少 3 根上漲）`,
+          `${rsiBull_1h ? "✅" : "❌"} 1h RSI 55–68 且上升`,
+          `${macdOkLong_1h ? "✅" : "❌"} 1h MACD 翻正或強勢站上`,
+          `${bbExpandUp_1h ? "✅" : "❌"} 1h BB 擴張（避免盤整假訊號）`,
+          `${volOk_1h ? "✅" : "❌"} 1h 量能脈衝（volPulse > 1.3）`,
+          `${vwapLongOk_1h ? "✅" : "❌"} 1h 不追高（VWAP 偏離 -0.5%~+2.5%）`,
+        ];
+      } else if (confirmShortScore >= PASS_SCORE) {
+        side = "short";
+        score = confirmShortScore;
+        techSummary = [
+          `${confirmShortConds.filter6h ? "✅" : "❌"} 6h 同向確認（趨勢 + 結構）`,
+          `${priceBelowEma_1h ? "✅" : "❌"} 1h 價格在 EMA20 下方`,
+          `${emaSlopeDown_1h ? "✅" : "❌"} 1h EMA20 下降（順勢）`,
+          `${structureBias_1h === "bearish" ? "✅" : "❌"} 1h 結構偏空（最近 5 根至少 3 根下跌）`,
+          `${rsiBear_1h ? "✅" : "❌"} 1h RSI 32–45 且下降`,
+          `${macdOkShort_1h ? "✅" : "❌"} 1h MACD 翻負或強勢跌破`,
+          `${bbExpandDown_1h ? "✅" : "❌"} 1h BB 擴張（避免盤整假訊號）`,
+          `${volOk_1h ? "✅" : "❌"} 1h 量能脈衝（volPulse > 1.3）`,
+          `${vwapShortOk_1h ? "✅" : "❌"} 1h 不追空（VWAP 偏離 -2.5%~+0.5%）`,
+        ];
+      } else {
+        continue;
+      }
+
+      // 強度（1~5）
+      const strength = clamp(Math.round((score / scoreMax) * 5), 1, 5);
+
+      // 進出場（勝率取向：不要太貪、RR 不要太極端）
       const basePrice = price;
-      const entry = basePrice;
-
+      let entry = basePrice;
       let stop, target;
       let riskPct, rewardPct;
 
       if (side === "long") {
-        if (stage === "early") {
-          stop = basePrice * 0.97;
-          target = basePrice * 1.04;
-          riskPct = 3;
-          rewardPct = 4;
-        } else {
-          stop = basePrice * 0.98;
-          target = basePrice * 1.05;
-          riskPct = 2;
-          rewardPct = 5;
-        }
+        // 強度越高，停損略縮、目標略放，持倉時間也更長
+        if (strength >= 5) { stop = basePrice * 0.985; target = basePrice * 1.045; riskPct = 1.5; rewardPct = 4.5; }
+        else if (strength >= 4) { stop = basePrice * 0.985; target = basePrice * 1.040; riskPct = 1.5; rewardPct = 4.0; }
+        else { stop = basePrice * 0.98; target = basePrice * 1.030; riskPct = 2.0; rewardPct = 3.0; }
       } else {
-        if (stage === "early") {
-          stop = basePrice * 1.03;
-          target = basePrice * 0.96;
-          riskPct = 3;
-          rewardPct = 4;
-        } else {
-          stop = basePrice * 1.02;
-          target = basePrice * 0.95;
-          riskPct = 2;
-          rewardPct = 5;
-        }
+        if (strength >= 5) { stop = basePrice * 1.015; target = basePrice * 0.955; riskPct = 1.5; rewardPct = 4.5; }
+        else if (strength >= 4) { stop = basePrice * 1.015; target = basePrice * 0.960; riskPct = 1.5; rewardPct = 4.0; }
+        else { stop = basePrice * 1.02; target = basePrice * 0.970; riskPct = 2.0; rewardPct = 3.0; }
       }
 
       const rr = rewardPct / riskPct;
 
+      const hold = suggestHoldProfile(strength);
+
       signals.push({
         symbol,
         side,
-        stage,
-        timeframe: tfKey,
+        stage: "confirm",
+        timeframe: "1h",
+        confirmTimeframe: "6h",
         strength,
         score,
         scoreMax,
         lastPrice: basePrice,
-        time: last.time,
+        time: last1h.time,
         entry,
         stop,
         target,
         riskPct,
         rewardPct,
         rr,
-        vwap,
-        vwapDevPct,
-        volMa20,
-        volMa5,
-        volCurrent,
-        volPulse,
-        structureBias,
+
+        // 透明化數值（你後面要顯示實際指標數字會用到）
+        ema20_1h,
+        rsi14_1h,
+        macd_1h,
+        bb_1h,
+        vwap_1h,
+        vwapDevPct_1h,
+        volMa20_1h,
+        volMa5_1h,
+        volCurrent_1h,
+        volPulse_1h,
+        structureBias_1h,
+
+        filter6h: {
+          ema20_6h,
+          rsi14_6h,
+          macd_6h,
+          structureBias_6h,
+          priceAboveEma_6h,
+          priceBelowEma_6h,
+          emaSlopeUp_6h,
+          emaSlopeDown_6h,
+        },
+
+        // 持倉建議（1–24h）
+        holdProfileKey: hold.key,
+        holdMinH: hold.minH,
+        holdMaxH: hold.maxH,
+        holdLabel: hold.label,
+
         techSummary,
       });
     } catch (err) {
-      console.error("[/api/screener] parse error:", symbol, tfKey, err.message || String(err));
+      console.error("[/api/screener] error:", symbol, err.message || String(err));
       errors.push({
         symbol,
-        timeframe: tfKey,
-        source: "PARSE",
+        timeframe: "1h/6h",
+        source: "FRONT",
         message: err.message || String(err),
       });
     }
   }
 
+  // 排序：強度 > 分數 > RR
   signals.sort((a, b) => {
-    if (a.stage !== b.stage) {
-      if (a.stage === "confirm" && b.stage === "early") return -1;
-      if (a.stage === "early" && b.stage === "confirm") return 1;
-    }
     if (b.strength !== a.strength) return b.strength - a.strength;
-    return 0;
+    if (b.score !== a.score) return b.score - a.score;
+    return (b.rr || 0) - (a.rr || 0);
   });
 
-  const payload = {
-    mode: "early-and-confirm-v3",
+  // 只取你要的「一天約 5 條」
+  const topSignals = signals.slice(0, MAX_SIGNALS);
+
+  res.json({
+    mode: "confirm-1h-with-6h-filter-v1",
     generatedAt: new Date().toISOString(),
     durationMs: Date.now() - started,
-    universe: {
-      count: symbolsToScan.length,
-      source: universe?.source || null,
-      notes: universe?.notes || null,
-      fetchedAt: universe?.fetchedAt ? new Date(universe.fetchedAt).toISOString() : null,
-    },
-    signals,
+    signals: topSignals,
     errors,
-  };
-
-  SCREENER_CACHE.payload = payload;
-  SCREENER_CACHE.fetchedAt = Date.now();
-
-  res.json(payload);
+    meta: {
+      maxSignals: MAX_SIGNALS,
+      entryTimeframe: ENTRY_TF.key,
+      confirmTimeframe: FILTER_TF.key,
+      passScore: PASS_SCORE,
+      note: "勝率優先：只輸出 confirm；1h 進場 + 6h 同向確認；每天訊號量目標約 5 條。",
+    },
+  });
 });
 
 // ---------- /api/backtest：單幣種回測模擬單 ----------
 // 範例：
-//   /api/backtest?symbol=BTC-USDT&timeframe=1h&bars=500&mode=both&side=both
+//   /api/backtest?symbol=BTC-USDT&timeframe=1h&bars=800&mode=confirm&side=both
 //
 // 參數：
 //   symbol     必填：如 BTC-USDT
-//   timeframe  30m / 1h（預設 1h）
-//   bars       抓幾根 K（預設 500）
-//   mode       early / confirm / both（預設 both，代表兩種訊號都可以開倉）
+//   timeframe  1h / 2h / 4h / 6h / 8h / 12h / 1d（預設 1h）
+//   bars       抓幾根 K（預設 800）
+//   mode       confirm（預設 confirm）
 //   side       long / short / both（預設 both）
 
 app.get("/api/backtest", async (req, res) => {
   const {
     symbol,
     timeframe = "1h",
-    bars = "500",
-    mode = "both",
+    bars = "800",
+    mode = "confirm",
     side = "both",
   } = req.query;
 
@@ -809,18 +660,26 @@ app.get("/api/backtest", async (req, res) => {
     return res.status(400).json({ error: "缺少 symbol 參數" });
   }
 
-  let kucoinType;
-  if (timeframe === "30m") kucoinType = "30min";
-  else if (timeframe === "1h") kucoinType = "1hour";
-  else {
-    return res.status(400).json({ error: "timeframe 目前只支援 30m 或 1h" });
+  const tfMap = {
+    "1h": "1hour",
+    "2h": "2hour",
+    "4h": "4hour",
+    "6h": "6hour",
+    "8h": "8hour",
+    "12h": "12hour",
+    "1d": "1day",
+  };
+
+  const kucoinType = tfMap[timeframe];
+  if (!kucoinType) {
+    return res.status(400).json({ error: "timeframe 只支援 1h/2h/4h/6h/8h/12h/1d" });
   }
 
-  const limit = parseInt(bars, 10) || 500;
+  const limit = parseInt(bars, 10) || 800;
 
   try {
     const candles = await fetchKuCoinCandles(symbol, kucoinType, limit);
-    if (!candles || candles.length < 120) {
+    if (!candles || candles.length < 160) {
       return res.status(400).json({
         error: "K 線資料不足，無法回測",
         candleCount: candles ? candles.length : 0,
@@ -830,10 +689,20 @@ app.get("/api/backtest", async (req, res) => {
     const closesAll = candles.map((c) => c.close);
     const volumesAll = candles.map((c) => c.volume);
 
-    const warmup = 80; // 至少 80 根之後才開始回測
-    const maxHoldBars = timeframe === "30m" ? 8 : 8; // 可再調整
+    const warmup = 120;
+    const tfMinutes =
+      timeframe === "1h" ? 60 :
+      timeframe === "2h" ? 120 :
+      timeframe === "4h" ? 240 :
+      timeframe === "6h" ? 360 :
+      timeframe === "8h" ? 480 :
+      timeframe === "12h" ? 720 :
+      1440;
 
-    let position = null; // 當前持倉
+    // 你要 1～24 小時：maxHoldBars 依 timeframe 自動換算
+    const maxHoldBars = Math.max(1, Math.round(24 * 60 / tfMinutes));
+
+    let position = null;
     const trades = [];
 
     let equityR = 0;
@@ -841,13 +710,12 @@ app.get("/api/backtest", async (req, res) => {
     let maxDrawdownR = 0;
 
     const sideFilter = side; // both / long / short
-    const modeFilter = mode; // both / early / confirm
 
     for (let i = warmup; i < candles.length; i++) {
       const candle = candles[i];
       const prevCandle = candles[i - 1];
 
-      // 先檢查是否有持倉需要出場（用當前這根的 high / low / close）
+      // 先出場
       if (position && i > position.openIndex) {
         const high = candle.high;
         const low = candle.low;
@@ -857,27 +725,21 @@ app.get("/api/backtest", async (req, res) => {
           const hitTP = high >= position.target;
           const hitSL = low <= position.stop;
 
-          if (hitTP && hitSL) {
-            exit = { price: position.stop, reason: "sl-tp-same-bar" };
-          } else if (hitTP) {
-            exit = { price: position.target, reason: "tp" };
-          } else if (hitSL) {
-            exit = { price: position.stop, reason: "sl" };
-          } else {
+          if (hitTP && hitSL) exit = { price: position.stop, reason: "sl-tp-same-bar" };
+          else if (hitTP) exit = { price: position.target, reason: "tp" };
+          else if (hitSL) exit = { price: position.stop, reason: "sl" };
+          else {
             const heldBars = i - position.openIndex;
             if (heldBars >= maxHoldBars) exit = { price: candle.close, reason: "time" };
           }
-        } else if (position.side === "short") {
+        } else {
           const hitTP = low <= position.target;
           const hitSL = high >= position.stop;
 
-          if (hitTP && hitSL) {
-            exit = { price: position.stop, reason: "sl-tp-same-bar" };
-          } else if (hitTP) {
-            exit = { price: position.target, reason: "tp" };
-          } else if (hitSL) {
-            exit = { price: position.stop, reason: "sl" };
-          } else {
+          if (hitTP && hitSL) exit = { price: position.stop, reason: "sl-tp-same-bar" };
+          else if (hitTP) exit = { price: position.target, reason: "tp" };
+          else if (hitSL) exit = { price: position.stop, reason: "sl" };
+          else {
             const heldBars = i - position.openIndex;
             if (heldBars >= maxHoldBars) exit = { price: candle.close, reason: "time" };
           }
@@ -887,28 +749,23 @@ app.get("/api/backtest", async (req, res) => {
           const entryPrice = position.entryPrice;
           const exitPrice = exit.price;
           const heldBars = i - position.openIndex;
-          const tfMinutes = timeframe === "30m" ? 30 : 60;
           const heldHours = (heldBars * tfMinutes) / 60;
 
           let pnlPct;
-          if (position.side === "long") {
-            pnlPct = ((exitPrice - entryPrice) / entryPrice) * 100;
-          } else {
-            pnlPct = ((entryPrice - exitPrice) / entryPrice) * 100;
-          }
+          if (position.side === "long") pnlPct = ((exitPrice - entryPrice) / entryPrice) * 100;
+          else pnlPct = ((entryPrice - exitPrice) / entryPrice) * 100;
 
           const riskPct = position.riskPct;
           const R = riskPct > 0 ? pnlPct / riskPct : 0;
 
           equityR += R;
           if (equityR > maxEquityR) maxEquityR = equityR;
-
           const drawdown = equityR - maxEquityR;
           if (drawdown < maxDrawdownR) maxDrawdownR = drawdown;
 
           trades.push({
             side: position.side,
-            stage: position.stage,
+            stage: "confirm",
             timeframe,
             entryIndex: position.openIndex,
             exitIndex: i,
@@ -933,181 +790,121 @@ app.get("/api/backtest", async (req, res) => {
         }
       }
 
-      // 若目前沒持倉，再用這一根的收盤價判斷「是否要開倉」
+      // 再進場（只做 confirm）
       if (!position) {
         const closes = closesAll.slice(0, i + 1);
         const volumes = volumesAll.slice(0, i + 1);
         const price = candle.close;
-        const prevClose = prevCandle.close;
 
         const ema20 = calculateEMA(closes, 20);
+        const ema20Prev = calculateEMA(closes.slice(0, -1), 20);
+        const emaSlopeUp = ema20 != null && ema20Prev != null ? ema20 > ema20Prev : false;
+        const emaSlopeDown = ema20 != null && ema20Prev != null ? ema20 < ema20Prev : false;
+
         const rsi14 = calculateRSI(closes, 14);
+        const rsiPrev = calculateRSI(closes.slice(0, -1), 14);
+        const rsiUp = rsi14 != null && rsiPrev != null ? rsi14 > rsiPrev : false;
+        const rsiDown = rsi14 != null && rsiPrev != null ? rsi14 < rsiPrev : false;
+
         const macd = calculateMACD(closes, 12, 26, 9);
         const bb = calculateBBLast(closes, 20, 2);
-        const vwap = calculateVWAP(candles.slice(0, i + 1), 30);
 
         const volMa20 = calculateSMA(volumes, 20);
         const volMa5 = calculateSMA(volumes, 5);
-        const volCurrent = volumes[volumes.length - 1];
-
-        const volSpike = volMa20 ? volCurrent > volMa20 * 2.0 : false;
         const volPulse = volMa5 && volMa20 ? volMa5 / volMa20 : 1;
-
-        const macdHist = macd ? macd.hist : null;
-        const macdHistPrev = macd ? macd.histPrev : null;
-
-        const macdUp =
-          macdHist != null &&
-          macdHistPrev != null &&
-          macdHist > macdHistPrev &&
-          macdHist >= 0;
-        const macdDown =
-          macdHist != null &&
-          macdHistPrev != null &&
-          macdHist < macdHistPrev &&
-          macdHist <= 0;
-
-        const bbExpandingUp =
-          bb && bb.widthPrev > 0 && bb.width > bb.widthPrev * 1.1 && price >= bb.middle;
-        const bbExpandingDown =
-          bb && bb.widthPrev > 0 && bb.width > bb.widthPrev * 1.1 && price <= bb.middle;
-
-        const priceAboveEma = ema20 && price > ema20;
-        const priceBelowEma = ema20 && price < ema20;
-
-        const trendUpShort = price > prevClose;
-        const trendDownShort = price < prevClose;
-
-        const rsiBull = rsi14 != null && rsi14 > 40 && rsi14 < 70;
-        const rsiBear = rsi14 != null && rsi14 > 30 && rsi14 < 60;
-
-        let vwapDevPct = null;
-        if (vwap) vwapDevPct = ((price - vwap) / vwap) * 100;
 
         const structureBias = detectStructureBias(closes);
 
-        const earlyLongConds = {
-          volSpike,
-          volPulseStrong: volPulse > 1.5,
-          macdUp,
-          bbExpandingUp,
-          priceAboveEma,
-          trendUpShort,
-          rsiBull,
-          vwapNearOrBelow: vwapDevPct != null && vwapDevPct > -1.5 && vwapDevPct < 3.0,
-          structureBull: structureBias === "bullish",
-        };
-        const earlyLongScore = Object.values(earlyLongConds).filter(Boolean).length;
+        const priceAboveEma = ema20 != null ? price > ema20 : false;
+        const priceBelowEma = ema20 != null ? price < ema20 : false;
 
+        const hist = macd ? macd.hist : null;
+        const histPrev = macd ? macd.histPrev : null;
+        const macdLine = macd ? macd.macd : null;
+        const signalLine = macd ? macd.signal : null;
+
+        const macdFlipUp = hist != null && histPrev != null && histPrev < 0 && hist > 0;
+        const macdFlipDown = hist != null && histPrev != null && histPrev > 0 && hist < 0;
+
+        const macdUpStrong =
+          macdLine != null && signalLine != null && macdLine > signalLine &&
+          hist != null && histPrev != null && hist > histPrev && hist > 0;
+
+        const macdDownStrong =
+          macdLine != null && signalLine != null && macdLine < signalLine &&
+          hist != null && histPrev != null && hist < histPrev && hist < 0;
+
+        const macdOkLong = macdFlipUp || macdUpStrong;
+        const macdOkShort = macdFlipDown || macdDownStrong;
+
+        const bbExpandUp =
+          bb && bb.widthPrev > 0 && bb.width > bb.widthPrev * 1.15 &&
+          bb.middle > 0 && (bb.width / bb.middle) > 0.02 &&
+          price >= bb.middle;
+
+        const bbExpandDown =
+          bb && bb.widthPrev > 0 && bb.width > bb.widthPrev * 1.15 &&
+          bb.middle > 0 && (bb.width / bb.middle) > 0.02 &&
+          price <= bb.middle;
+
+        const rsiBull = rsi14 != null && rsi14 >= 55 && rsi14 <= 68 && rsiUp;
+        const rsiBear = rsi14 != null && rsi14 >= 32 && rsi14 <= 45 && rsiDown;
+
+        const volOk = volPulse > 1.3;
+
+        // confirm 分數（不含 6h filter，回測先做單一週期）
         const confirmLongConds = {
           priceAboveEma,
+          emaSlopeUp,
+          structureBull: structureBias === "bullish",
           rsiBull,
-          macdUp,
-          bbExpandingUp,
-          trendUpShort,
-          volPulseGood: volPulse > 1.2,
-          vwapHealthy: vwapDevPct != null && vwapDevPct > -1.0 && vwapDevPct < 4.5,
+          macdOkLong,
+          bbExpandUp,
+          volOk,
         };
-        const confirmLongScore = Object.values(confirmLongConds).filter(Boolean).length;
-
-        const earlyShortConds = {
-          volSpike,
-          volPulseStrong: volPulse > 1.5,
-          macdDown,
-          bbExpandingDown,
-          priceBelowEma,
-          trendDownShort,
-          rsiBear,
-          vwapNearOrAbove: vwapDevPct != null && vwapDevPct < 1.5 && vwapDevPct > -3.0,
-          structureBear: structureBias === "bearish",
-        };
-        const earlyShortScore = Object.values(earlyShortConds).filter(Boolean).length;
-
         const confirmShortConds = {
           priceBelowEma,
+          emaSlopeDown,
+          structureBear: structureBias === "bearish",
           rsiBear,
-          macdDown,
-          bbExpandingDown,
-          trendDownShort,
-          volPulseGood: volPulse > 1.2,
-          vwapHealthy: vwapDevPct != null && vwapDevPct < 1.0 && vwapDevPct > -4.5,
+          macdOkShort,
+          bbExpandDown,
+          volOk,
         };
-        const confirmShortScore = Object.values(confirmShortConds).filter(Boolean).length;
 
-        const scoreMax = 9;
+        const longScore = Object.values(confirmLongConds).filter(Boolean).length;
+        const shortScore = Object.values(confirmShortConds).filter(Boolean).length;
+        const scoreMax = 7;
+
+        const PASS = 6;
 
         let candidate = null;
 
-        if (
-          (sideFilter === "both" || sideFilter === "long") &&
-          (earlyLongScore >= 2 || confirmLongScore >= 3)
-        ) {
-          let stage = null;
-          let score = 0;
-          if (confirmLongScore >= 3 && (modeFilter === "both" || modeFilter === "confirm")) {
-            stage = "confirm";
-            score = confirmLongScore;
-          } else if (earlyLongScore >= 2 && (modeFilter === "both" || modeFilter === "early")) {
-            stage = "early";
-            score = earlyLongScore;
-          }
-          if (stage) candidate = { side: "long", stage, score };
+        if ((sideFilter === "both" || sideFilter === "long") && longScore >= PASS) {
+          candidate = { side: "long", score: longScore };
         }
-
-        if (
-          !candidate &&
-          (sideFilter === "both" || sideFilter === "short") &&
-          (earlyShortScore >= 2 || confirmShortScore >= 3)
-        ) {
-          let stage = null;
-          let score = 0;
-          if (confirmShortScore >= 3 && (modeFilter === "both" || modeFilter === "confirm")) {
-            stage = "confirm";
-            score = confirmShortScore;
-          } else if (earlyShortScore >= 2 && (modeFilter === "both" || modeFilter === "early")) {
-            stage = "early";
-            score = earlyShortScore;
-          }
-          if (stage) candidate = { side: "short", stage, score };
+        if (!candidate && (sideFilter === "both" || sideFilter === "short") && shortScore >= PASS) {
+          candidate = { side: "short", score: shortScore };
         }
 
         if (candidate) {
-          const entryPrice = price;
-          let stop, target;
-          let riskPct, rewardPct;
+          const strength = clamp(Math.round((candidate.score / scoreMax) * 5), 1, 5);
 
+          let stop, target, riskPct, rewardPct;
           if (candidate.side === "long") {
-            if (candidate.stage === "early") {
-              stop = entryPrice * 0.97;
-              target = entryPrice * 1.04;
-              riskPct = 3;
-              rewardPct = 4;
-            } else {
-              stop = entryPrice * 0.98;
-              target = entryPrice * 1.05;
-              riskPct = 2;
-              rewardPct = 5;
-            }
+            if (strength >= 5) { stop = price * 0.985; target = price * 1.045; riskPct = 1.5; rewardPct = 4.5; }
+            else if (strength >= 4) { stop = price * 0.985; target = price * 1.040; riskPct = 1.5; rewardPct = 4.0; }
+            else { stop = price * 0.98; target = price * 1.030; riskPct = 2.0; rewardPct = 3.0; }
           } else {
-            if (candidate.stage === "early") {
-              stop = entryPrice * 1.03;
-              target = entryPrice * 0.96;
-              riskPct = 3;
-              rewardPct = 4;
-            } else {
-              stop = entryPrice * 1.02;
-              target = entryPrice * 0.95;
-              riskPct = 2;
-              rewardPct = 5;
-            }
+            if (strength >= 5) { stop = price * 1.015; target = price * 0.955; riskPct = 1.5; rewardPct = 4.5; }
+            else if (strength >= 4) { stop = price * 1.015; target = price * 0.960; riskPct = 1.5; rewardPct = 4.0; }
+            else { stop = price * 1.02; target = price * 0.970; riskPct = 2.0; rewardPct = 3.0; }
           }
-
-          const strength = Math.max(1, Math.min(5, Math.round((candidate.score / scoreMax) * 5)));
 
           position = {
             side: candidate.side,
-            stage: candidate.stage,
-            entryPrice,
+            stage: "confirm",
+            entryPrice: price,
             stop,
             target,
             openIndex: i,
@@ -1121,34 +918,30 @@ app.get("/api/backtest", async (req, res) => {
       }
     }
 
+    // 收尾平倉
     const lastIdx = candles.length - 1;
     if (position) {
       const lastCandle = candles[lastIdx];
       const entryPrice = position.entryPrice;
       const exitPrice = lastCandle.close;
       const heldBars = lastIdx - position.openIndex;
-      const tfMinutes = timeframe === "30m" ? 30 : 60;
       const heldHours = (heldBars * tfMinutes) / 60;
 
       let pnlPct;
-      if (position.side === "long") {
-        pnlPct = ((exitPrice - entryPrice) / entryPrice) * 100;
-      } else {
-        pnlPct = ((entryPrice - exitPrice) / entryPrice) * 100;
-      }
+      if (position.side === "long") pnlPct = ((exitPrice - entryPrice) / entryPrice) * 100;
+      else pnlPct = ((entryPrice - exitPrice) / entryPrice) * 100;
 
       const riskPct = position.riskPct;
       const R = riskPct > 0 ? pnlPct / riskPct : 0;
 
       equityR += R;
       if (equityR > maxEquityR) maxEquityR = equityR;
-
       const drawdown = equityR - maxEquityR;
       if (drawdown < maxDrawdownR) maxDrawdownR = drawdown;
 
       trades.push({
         side: position.side,
-        stage: position.stage,
+        stage: "confirm",
         timeframe,
         entryIndex: position.openIndex,
         exitIndex: lastIdx,
@@ -1170,6 +963,7 @@ app.get("/api/backtest", async (req, res) => {
       });
     }
 
+    // 統計
     const totalTrades = trades.length;
     const wins = trades.filter((t) => t.pnlPct > 0);
     const losses = trades.filter((t) => t.pnlPct <= 0);
@@ -1189,20 +983,12 @@ app.get("/api/backtest", async (req, res) => {
     const avgHoldBars =
       totalTrades > 0 ? trades.reduce((s, t) => s + t.heldBars, 0) / totalTrades : 0;
 
-    const result = {
+    res.json({
       symbol,
       timeframe,
       candleCount: candles.length,
-      backtestRange: {
-        startTime: candles[warmup].time,
-        endTime: candles[lastIdx].time,
-      },
-      params: {
-        mode: modeFilter,
-        side: sideFilter,
-        bars: limit,
-        maxHoldBars,
-      },
+      backtestRange: { startTime: candles[warmup].time, endTime: candles[lastIdx].time },
+      params: { mode, side: sideFilter, bars: limit, maxHoldBars, tfMinutes },
       stats: {
         totalTrades,
         winTrades: wins.length,
@@ -1219,9 +1005,7 @@ app.get("/api/backtest", async (req, res) => {
         avgHoldBars,
       },
       trades,
-    };
-
-    res.json(result);
+    });
   } catch (err) {
     console.error("[/api/backtest] error:", err);
     res.status(500).json({
@@ -1234,6 +1018,6 @@ app.get("/api/backtest", async (req, res) => {
 // ---------- 啟動伺服器 ----------
 
 app.listen(PORT, () => {
-  console.log("🚀 server.js 已載入（Screener + Backtest）");
-  console.log(`✅ Server running on :${PORT}`);
+  console.log("🚀 server.js 已載入（勝率優先：1h confirm + 6h filter + 回測）");
+  console.log(`✅ KuCoin Proxy + Screener 運行中: http://localhost:${PORT}`);
 });

@@ -9,9 +9,13 @@ const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:4000";
 
 const TIMEFRAME_FILTERS = [
   { key: "all", label: "全部週期" },
-  { key: "30m", label: "30 分鐘" },
   { key: "1h", label: "1 小時" },
-  { key: "4h", label: "4 小時" }, // UI 保留，不代表你一定要用
+  { key: "2h", label: "2 小時" },
+  { key: "4h", label: "4 小時" },
+  { key: "6h", label: "6 小時" },
+  { key: "8h", label: "8 小時" },
+  { key: "12h", label: "12 小時" },
+  { key: "1d", label: "1 天" },
 ];
 
 const SIDE_FILTERS = [
@@ -22,7 +26,6 @@ const SIDE_FILTERS = [
 
 const STAGE_FILTERS = [
   { key: "all", label: "全部" },
-  { key: "early", label: "提前預判" },
   { key: "confirm", label: "確認進場" },
 ];
 
@@ -31,10 +34,12 @@ const PAPER_MARGIN_USDT = 100; // 每單投入 100U
 const PAPER_LEVERAGE = 10; // 10x
 const PAPER_NOTIONAL_USDT = PAPER_MARGIN_USDT * PAPER_LEVERAGE; // 名目 1000U
 
-// ===== 持倉方案（你指定要補 4-12 小時）=====
+// ===== 持倉方案（1–24 小時）=====
 const HOLD_PROFILES = [
-  { key: "4-6", label: "短波 4–6 小時", minH: 4, maxH: 6 },
+  { key: "1-4", label: "超短 1–4 小時", minH: 1, maxH: 4 },
+  { key: "4-8", label: "短波 4–8 小時", minH: 4, maxH: 8 },
   { key: "8-12", label: "波段 8–12 小時", minH: 8, maxH: 12 },
+  { key: "12-24", label: "長波 12–24 小時", minH: 12, maxH: 24 },
 ];
 
 const LS_TRADES = "kcs_paper_trades_v2_single";
@@ -78,36 +83,35 @@ function calcPnlUSDT({ side, entryPrice, currentPrice }) {
   return signed * PAPER_NOTIONAL_USDT;
 }
 
-// 合併同幣同向的 30m/1h 訊號來源（只用來顯示「來源週期」與 stage/score 最佳值）
+// 合併同幣同向的訊號來源（保留原本用法）
 function mergeSourcesForSymbol(signals, symbol, side) {
   const list = (signals || []).filter((s) => s?.symbol === symbol && s?.side === side);
   const tfSet = new Set(list.map((x) => x.timeframe).filter(Boolean));
 
   const sourceTimeframes = Array.from(tfSet).sort((a, b) => {
-    const order = { "30m": 1, "1h": 2 };
+    const order = { "1h": 1, "2h": 2, "4h": 3, "6h": 4, "8h": 5, "12h": 6, "1d": 7 };
     return (order[a] || 99) - (order[b] || 99);
   });
-
-  const mergedStage = list.some((x) => x.stage === "confirm") ? "confirm" : "early";
 
   let bestSignal = null;
   for (const x of list) {
     if (!bestSignal) bestSignal = x;
+    else if ((x?.strength || 0) > (bestSignal?.strength || 0)) bestSignal = x;
     else if ((x?.score || 0) > (bestSignal?.score || 0)) bestSignal = x;
   }
 
-  return { sourceTimeframes, mergedStage, bestSignal };
-}
+  const mergedStage = list.some((x) => x.stage === "confirm") ? "confirm" : "confirm";
 
-function defaultHoldProfileKeyByStage(stage) {
-  // confirm 走比較波段，early 走比較短波（你之後也能手動切）
-  if (stage === "confirm") return "8-12";
-  return "4-6";
+  return { sourceTimeframes, mergedStage, bestSignal };
 }
 
 function holdLabel(key) {
   const p = HOLD_PROFILES.find((x) => x.key === key);
   return p ? p.label : "-";
+}
+
+function getProfile(key) {
+  return HOLD_PROFILES.find((x) => x.key === key) || HOLD_PROFILES[0];
 }
 
 export default function KuCoinStrategyScreener() {
@@ -218,7 +222,7 @@ export default function KuCoinStrategyScreener() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 自動刷新（你說不用太密，我把下限改成 10 秒）
+  // 自動刷新（下限 10 秒）
   useEffect(() => {
     if (!autoRefresh) return;
     const sec = Math.max(10, Number(refreshSec) || 30);
@@ -238,7 +242,7 @@ export default function KuCoinStrategyScreener() {
     return m;
   }, [signals]);
 
-  // ===== 每次 signals 更新 -> 更新所有模擬單 currentPrice + 合併來源週期資訊 =====
+  // ===== 每次 signals 更新 -> 更新所有模擬單 currentPrice + 來源資訊 =====
   useEffect(() => {
     if (!paperTrades.length) return;
 
@@ -255,6 +259,11 @@ export default function KuCoinStrategyScreener() {
           mergedStage: merged.mergedStage || t.mergedStage,
           bestScore: merged.bestSignal?.score ?? t.bestScore,
           bestScoreMax: merged.bestSignal?.scoreMax ?? t.bestScoreMax,
+          confirmTimeframe: merged.bestSignal?.confirmTimeframe ?? t.confirmTimeframe,
+          holdProfileKey: merged.bestSignal?.holdProfileKey ?? t.holdProfileKey,
+          holdMinH: merged.bestSignal?.holdMinH ?? t.holdMinH,
+          holdMaxH: merged.bestSignal?.holdMaxH ?? t.holdMaxH,
+          holdLabel: merged.bestSignal?.holdLabel ?? t.holdLabel,
         };
       })
     );
@@ -280,14 +289,13 @@ export default function KuCoinStrategyScreener() {
     const sSide = signal.side;
 
     const merged = mergeSourcesForSymbol(signals, symbol, sSide);
-    const stageMerged = merged.mergedStage || signal.stage;
-
-    const defaultHoldKey = defaultHoldProfileKeyByStage(stageMerged);
-    const profile = HOLD_PROFILES.find((x) => x.key === defaultHoldKey) || HOLD_PROFILES[0];
 
     const now = new Date().toISOString();
     const entry = Number(signal.entry ?? signal.lastPrice);
     const cur = Number(signal.lastPrice ?? signal.entry);
+
+    const profileKey = signal.holdProfileKey || "4-8";
+    const profile = getProfile(profileKey);
 
     const trade = {
       id: `pt_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -301,16 +309,18 @@ export default function KuCoinStrategyScreener() {
       notionalUSDT: PAPER_NOTIONAL_USDT,
       status: "open",
 
-      // 合併來源週期（30m/1h 同向）
+      // 來源/確認週期
       sourceTimeframes: merged.sourceTimeframes?.length ? merged.sourceTimeframes : [signal.timeframe].filter(Boolean),
-      mergedStage: stageMerged,
-      bestScore: merged.bestSignal?.score ?? signal.score,
-      bestScoreMax: merged.bestSignal?.scoreMax ?? signal.scoreMax,
+      confirmTimeframe: signal.confirmTimeframe || "6h",
+      mergedStage: "confirm",
+      bestScore: signal.score,
+      bestScoreMax: signal.scoreMax,
 
-      // 持倉方案
+      // 持倉方案（1–24h）
       holdProfileKey: profile.key,
       holdMinH: profile.minH,
       holdMaxH: profile.maxH,
+      holdLabel: signal.holdLabel || profile.label,
       closeByTime: addHoursISO(now, profile.maxH),
       lastPriceUpdatedAt: null,
     };
@@ -344,12 +354,13 @@ export default function KuCoinStrategyScreener() {
       prev.map((t) => {
         if (t.id !== tradeId) return t;
 
-        const profile = HOLD_PROFILES.find((x) => x.key === nextKey) || HOLD_PROFILES[0];
+        const profile = getProfile(nextKey);
         return {
           ...t,
           holdProfileKey: profile.key,
           holdMinH: profile.minH,
           holdMaxH: profile.maxH,
+          holdLabel: profile.label,
           closeByTime: addHoursISO(t.openTime, profile.maxH),
         };
       })
@@ -459,8 +470,6 @@ export default function KuCoinStrategyScreener() {
     );
   };
 
-  const openTrade = paperTrades[0] || null;
-
   return (
     <div style={{ padding: 18, color: ui.text, background: ui.bg, minHeight: "100vh" }}>
       {/* Header */}
@@ -473,7 +482,7 @@ export default function KuCoinStrategyScreener() {
           <div style={{ marginTop: 8, fontSize: 15, color: ui.muted, lineHeight: 1.5 }}>
             後端：<span style={{ color: ui.accent, fontWeight: 800 }}>{`${API_BASE}/api/screener`}</span>
             <br />
-            顯示的是「進場訊號」，模擬單為粗略估算。
+            勝率優先：只出「確認進場」，並用 6h 同向確認（訊號量目標一天約 5 條）。
           </div>
         </div>
 
@@ -612,7 +621,7 @@ export default function KuCoinStrategyScreener() {
           </div>
         </div>
 
-        {!openTrade ? (
+        {paperTrades.length === 0 ? (
           <div style={{ marginTop: 12, color: ui.muted, fontSize: 14 }}>
             目前沒有未平倉模擬單。你可以在下方訊號卡片按「建立模擬單」（同一個幣最多一單）。
           </div>
@@ -621,10 +630,6 @@ export default function KuCoinStrategyScreener() {
             {paperTrades.map((t) => {
               const pnl = calcPnlUSDT(t);
               const roi = PAPER_MARGIN_USDT ? (pnl / PAPER_MARGIN_USDT) * 100 : 0;
-
-              const sources = Array.isArray(t.sourceTimeframes) && t.sourceTimeframes.length
-                ? t.sourceTimeframes.join(" + ")
-                : "-";
 
               return (
                 <div
@@ -638,14 +643,11 @@ export default function KuCoinStrategyScreener() {
                 >
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
                     <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                      <div style={{ fontSize: 18, fontWeight: 900 }}>
-                        {t.symbol}
-                      </div>
+                      <div style={{ fontSize: 18, fontWeight: 900 }}>{t.symbol}</div>
                       <Pill tone={t.side === "long" ? "good" : "bad"}>
                         {t.side === "long" ? "做多" : "做空"} · {t.leverage}x
                       </Pill>
-                      <Pill>來源：{sources}</Pill>
-                      <Pill>{t.mergedStage === "confirm" ? "確認進場" : "提前預判"}</Pill>
+                      <Pill>1h 進場 · {t.confirmTimeframe || "6h"} 確認</Pill>
                     </div>
 
                     <SmallBtn tone="warn" onClick={() => closePaperTrade(t.id)} title="將此單平倉並計入已實現盈虧">
@@ -653,7 +655,7 @@ export default function KuCoinStrategyScreener() {
                     </SmallBtn>
                   </div>
 
-                  {/* 持倉方案（必須顯示在 UI，且模擬單也要有方案） */}
+                  {/* 持倉方案 */}
                   <div style={{ marginTop: 12, display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
                     <Pill>持倉方案：{holdLabel(t.holdProfileKey)}</Pill>
 
@@ -699,14 +701,11 @@ export default function KuCoinStrategyScreener() {
                       <div style={{ marginTop: 6 }}>
                         <b style={{ color: ui.text }}>名目：</b> {fmt2(PAPER_NOTIONAL_USDT)} U
                       </div>
-                      <div style={{ marginTop: 6 }}>
-                        <b style={{ color: ui.text }}>強度：</b> {t.bestScore ?? "-"} / {t.bestScoreMax ?? "-"}
-                      </div>
                     </div>
                   </div>
 
                   <div style={{ marginTop: 10, color: ui.muted2, fontSize: 13 }}>
-                    註：你關掉網頁不會更新沒關係；下次打開網頁抓到新 signals 後，會更新這單的損益。
+                    註：你關掉網頁不會更新沒關係；下次打開抓到新 signals 後，會更新這單的損益。
                   </div>
                 </div>
               );
@@ -729,7 +728,7 @@ export default function KuCoinStrategyScreener() {
               fontWeight: 800,
             }}
           >
-            目前沒有符合條件的進場訊號（或暫時抓不到資料）。你可以調整篩選條件或稍後再刷新。
+            目前沒有符合條件的進場訊號（勝率優先所以會比較少）。你可以稍後再刷新。
           </div>
         ) : (
           <div
@@ -741,12 +740,8 @@ export default function KuCoinStrategyScreener() {
           >
             {filteredSignals.map((s, idx) => {
               const tone = s.side === "long" ? "good" : "bad";
-              const stageLabel = s.stage === "early" ? "提前預判" : "確認進場";
 
               const disabledOpen = paperTrades.some((t) => t.symbol === s.symbol && t.status === "open");
-
-              // 提示：依 stage 給你建議持倉方案（顯示用，不會強制）
-              const suggestedKey = defaultHoldProfileKeyByStage(s.stage);
 
               return (
                 <div
@@ -764,9 +759,10 @@ export default function KuCoinStrategyScreener() {
                         {s.symbol} · {s.timeframe}
                       </div>
                       <Pill tone={tone}>{s.side === "long" ? "做多" : "做空"}</Pill>
-                      <Pill>{stageLabel}</Pill>
+                      <Pill>確認進場</Pill>
                       <Pill>強度 {s.score}/{s.scoreMax}</Pill>
-                      <Pill tone="warn">建議持倉：{holdLabel(suggestedKey)}</Pill>
+                      <Pill tone="warn">6h 同向確認</Pill>
+                      <Pill tone="warn">建議持倉：{s.holdLabel || holdLabel(s.holdProfileKey)}</Pill>
                     </div>
 
                     <div style={{ display: "flex", gap: 10 }}>
@@ -777,7 +773,7 @@ export default function KuCoinStrategyScreener() {
                         title={
                           disabledOpen
                             ? "同一個幣只能一單：此幣已經有未平倉模擬單"
-                            : "建立模擬單（會合併同幣同向 30m/1h，並給持倉方案與最晚平倉時間）"
+                            : "建立模擬單（勝率優先訊號：1h 進場 + 6h 同向確認）"
                         }
                       >
                         建立模擬單
@@ -797,7 +793,7 @@ export default function KuCoinStrategyScreener() {
                       <div><b style={{ color: ui.text }}>RR：</b>{fmt2(s.rr)}</div>
                       <div><b style={{ color: ui.text }}>risk：</b>{fmt2(s.riskPct)}%</div>
                       <div><b style={{ color: ui.text }}>reward：</b>{fmt2(s.rewardPct)}%</div>
-                      <div><b style={{ color: ui.text }}>結構偏向：</b>{s.structureBias ?? "-"}</div>
+                      <div><b style={{ color: ui.text }}>結構偏向：</b>{s.structureBias_1h ?? "-"}</div>
                     </div>
                   </div>
 
