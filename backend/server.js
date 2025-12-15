@@ -341,14 +341,20 @@ app.get("/api/screener", async (req, res) => {
     for (const tf of TIMEFRAMES) {
       try {
         const [candles, ticker] = await Promise.all([
-          fetchKuCoinCandles(symbol, tf.kucoinType, 200),
+          fetchKuCoinCandles(symbol, tf.kucoinType, 500),
           fetchKuCoinTicker(symbol),
         ]);
 
-        if (!candles || candles.length < 120) {
-          errors.push({ symbol, timeframe: tf.key, source: "CANDLES", message: "K 線資料不足" });
-          continue;
-        }
+        const minBars = tf.key === "6h" ? 60 : 120;
+if (!candles || candles.length < minBars) {
+  errors.push({
+    symbol,
+    timeframe: tf.key,
+    source: "CANDLES",
+    message: `K 線資料不足（need ${minBars}, got ${candles ? candles.length : 0}）`,
+  });
+  continue;
+}
 
         const closes = candles.map((c) => c.close);
         const volumes = candles.map((c) => c.volume);
