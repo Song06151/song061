@@ -1,10 +1,8 @@
-// server.js
-// KuCoin Proxy + Screener (Tier A confirm + Tier B watch)
-//
-// Endpoints:
-//   GET /api/kucoin/candles?symbol=BTC-USDT&type=1hour&limit=200
-//   GET /api/kucoin/ticker?symbol=BTC-USDT
-//   GET /api/screener
+// backend/server.js
+// KuCoin 策略掃描器後端（Tier A 可進場 / Tier B 觀察）
+// - Top 50 by volume（USDT quote）
+// - 排除穩定幣類交易對（例如 USDC-USDT、USD1-USDT 等）
+// - Tier A 稍微更嚴苛：目標一次約 ~10 張可開單候選（視盤況）
 //
 // npm i express cors node-fetch@2
 
@@ -32,9 +30,11 @@ const TIMEFRAMES = [
   { key: "6h", kucoinType: "6hour" },
 ];
 
+// Tier 門檻
 const WATCH_MIN_SCORE = 2;    // Tier B
-const CONFIRM_MIN_SCORE = 3;  // Tier A
+const CONFIRM_MIN_SCORE = 4;  // ✅ 更嚴苛一點（原本 3）
 
+// 依指標推導最低 bars（避免 6h 常不足）
 const INDICATOR_REQUIREMENTS = {
   EMA50: 55,
   MACD: 40,
@@ -47,6 +47,34 @@ const INDICATOR_REQUIREMENTS = {
 
 function getRequiredMinBars() {
   return Math.max(...Object.values(INDICATOR_REQUIREMENTS));
+}
+
+// ✅ 排除「穩定幣類 base」
+// 你提到 USDC / USD1，我這邊直接把常見穩定幣一起排除，避免卡片被穩定幣洗掉
+const EXCLUDED_BASES = new Set([
+  "USDC",
+  "USD1",
+  "USDT", // 理論上不會出現 base=USDT、quote=USDT，但保險
+  "TUSD",
+  "USDP",
+  "USDD",
+  "DAI",
+  "FDUSD",
+  "BUSD",
+  "PYUSD",
+  "FRAX",
+  "GUSD",
+  "USDE",
+]);
+
+function isExcludedSymbol(symbol) {
+  // 只處理形如 XXX-USDT
+  const parts = String(symbol || "").split("-");
+  if (parts.length !== 2) return false;
+  const base = parts[0].toUpperCase();
+  const quote = parts[1].toUpperCase();
+  if (quote !== "USDT") return false;
+  return EXCLUDED_BASES.has(base);
 }
 
 // symbols cache
@@ -233,12 +261,13 @@ async function fetchKuCoinTicker(symbol) {
   return { symbol: json.data.symbol, price: parseFloat(json.data.price) };
 }
 
-async function fetchTopUSDTByVol(limit = 80) {
+async function fetchTopUSDTByVol(limit = 50) {
   const now = Date.now();
   if (_symbolsCache.list && now - _symbolsCache.at < SYMBOLS_CACHE_MS) {
     return _symbolsCache.list;
   }
 
+  // symbols（可交易、USDT quote）
   const symRes = await fetch(`${KUCOIN_API_BASE}/symbols`);
   const symJson = await symRes.json();
   if (symJson.code !== "200000" || !Array.isArray(symJson.data)) {
@@ -250,6 +279,7 @@ async function fetchTopUSDTByVol(limit = 80) {
       .map((s) => s.symbol)
   );
 
+  // allTickers（volValue）
   const tRes = await fetch(`${KUCOIN_API_BASE}/market/allTickers`);
   const tJson = await tRes.json();
   const tickers = tJson?.data?.ticker;
@@ -257,20 +287,19 @@ async function fetchTopUSDTByVol(limit = 80) {
     throw new Error(`KuCoin allTickers 回傳錯誤: ${tJson.code} ${tJson.msg || ""}`);
   }
 
-  const ranked = tickers
+  let ranked = tickers
     .filter((t) => t && tradableUSDT.has(t.symbol))
     .map((t) => ({ symbol: t.symbol, volValue: parseFloat(t.volValue || "0") }))
     .filter((x) => Number.isFinite(x.volValue) && x.volValue > 0)
     .sort((a, b) => b.volValue - a.volValue)
-    .slice(0, limit)
     .map((x) => x.symbol);
 
-  const list = ranked.length
-    ? ranked
-    : ["BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "BNB-USDT"];
+  // ✅ 排除穩定幣類
+  ranked = ranked.filter((s) => !isExcludedSymbol(s));
 
+  const list = ranked.slice(0, limit);
   _symbolsCache = { at: now, list };
-  return list;
+  return list.length ? list : ["BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "BNB-USDT"];
 }
 
 // -----------------------------
@@ -286,7 +315,6 @@ app.get("/api/kucoin/candles", async (req, res) => {
     const candles = await fetchKuCoinCandles(symbol, type, Number(limit) || 200);
     res.json(candles);
   } catch (err) {
-    console.error("[/api/kucoin/candles] error:", err.message);
     res.status(502).json({ code: 502, msg: "KuCoin K 線數據獲取失敗", detail: err.message });
   }
 });
@@ -300,13 +328,12 @@ app.get("/api/kucoin/ticker", async (req, res) => {
     const t = await fetchKuCoinTicker(symbol);
     res.json(t);
   } catch (err) {
-    console.error("[/api/kucoin/ticker] error:", err.message);
     res.status(502).json({ code: 502, msg: "KuCoin Ticker 獲取失敗", detail: err.message });
   }
 });
 
 // -----------------------------
-// helpers: parse query filters
+// helpers: query parsing
 // -----------------------------
 
 function parseCsvOrSingle(v) {
@@ -336,14 +363,15 @@ function matchFilter(str, q) {
 app.get("/api/screener", async (req, res) => {
   const started = Date.now();
 
-  const errors = [];
   const signals = [];
+  const errors = [];
 
-  const top = Math.max(1, Math.min(200, Number(req.query.top) || 80));
-  const candlesLimit = Math.max(50, Math.min(1500, Number(req.query.limit) || 500));
+  // ✅ 你要 Top 50
+  const top = Math.max(1, Math.min(200, Number(req.query.top) || 50));
+  const candlesLimit = Math.max(80, Math.min(1500, Number(req.query.limit) || 500));
   const minBars = Math.max(30, Math.min(500, Number(req.query.minBars) || getRequiredMinBars()));
   const includeErrors = String(req.query.includeErrors ?? "1") !== "0";
-  const maxSignals = Math.max(10, Math.min(2000, Number(req.query.maxSignals) || 200));
+  const maxSignals = Math.max(10, Math.min(2000, Number(req.query.maxSignals) || 120)); // 預設再小一點，避免洗太多
 
   const stageFilter = normalizeEnum(req.query.stage, ["all", "confirm", "watch"], "all");
   const sideFilter = normalizeEnum(req.query.side, ["all", "long", "short"], "all");
@@ -362,8 +390,7 @@ app.get("/api/screener", async (req, res) => {
   try {
     SYMBOLS = await fetchTopUSDTByVol(top);
   } catch (e) {
-    console.error("[symbols] error:", e.message || String(e));
-    errors.push({ symbol: "-", timeframe: "-", source: "SYMBOLS", message: e.message || String(e) });
+    if (includeErrors) errors.push({ symbol: "-", timeframe: "-", source: "SYMBOLS", message: e.message || String(e) });
     SYMBOLS = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "BNB-USDT"];
   }
 
@@ -377,7 +404,7 @@ app.get("/api/screener", async (req, res) => {
   const tfsToScan = TIMEFRAMES.filter((t) => tfList.includes(t.key));
   if (tfsToScan.length === 0) {
     return res.json({
-      mode: `tierA-confirm + tierB-watch`,
+      mode: `TierA確認 + TierB觀察（1h/6h）`,
       generatedAt: new Date().toISOString(),
       durationMs: Date.now() - started,
       params: { top, limit: candlesLimit, minBars, timeframe: tfRaw, stage: stageFilter, side: sideFilter, symbol: symbolQuery },
@@ -444,8 +471,9 @@ app.get("/api/screener", async (req, res) => {
         const trendUpShort = price > prevClose;
         const trendDownShort = price < prevClose;
 
-        const rsiPullbackLong = rsi14 != null && rsi14 >= 45 && rsi14 <= 58;
-        const rsiPullbackShort = rsi14 != null && rsi14 <= 55 && rsi14 >= 42;
+        // ✅ RSI 回踩區收窄（更嚴苛）
+        const rsiPullbackLong = rsi14 != null && rsi14 >= 48 && rsi14 <= 55;
+        const rsiPullbackShort = rsi14 != null && rsi14 >= 45 && rsi14 <= 52;
 
         const rsiHotLong = rsi14 != null && rsi14 >= 60 && rsi14 <= 72;
         const rsiColdShort = rsi14 != null && rsi14 >= 28 && rsi14 <= 40;
@@ -459,13 +487,14 @@ app.get("/api/screener", async (req, res) => {
         const breakoutUp = range ? price >= range.hi : false;
         const breakoutDown = range ? price <= range.lo : false;
 
-        // Tier B (watch)
+        // 趨勢 / 結構
         const trendLongOk = ema20 && ema50 && ema20 > ema50 && priceAboveEma20;
         const trendShortOk = ema20 && ema50 && ema20 < ema50 && priceBelowEma20;
 
         const structureLongOk = structureBias !== "bearish";
         const structureShortOk = structureBias !== "bullish";
 
+        // ---------- Tier B（觀察） ----------
         const watchLongMust = trendLongOk && structureLongOk;
         const watchShortMust = trendShortOk && structureShortOk;
 
@@ -493,14 +522,15 @@ app.get("/api/screener", async (req, res) => {
         };
         const watchShortScore = Object.values(watchShortScoreItems).filter(Boolean).length;
 
-        // Tier A (confirm)
+        // ---------- Tier A（確認進場） ----------
+        // ✅ VWAP 偏離縮小（更嚴苛，避免追價）
         const confirmLongItems = {
           trendLongOk,
           rsiPullbackLong,
           macdUp,
           bbExpandingUp: bbExpanding && bb && price >= bb.middle,
           volPulseOk: volPulse > 1.1,
-          vwapOk: vwapDevPct != null && vwapDevPct > -2.0 && vwapDevPct < 5.0,
+          vwapOk: vwapDevPct != null && vwapDevPct > -1.5 && vwapDevPct < 3.0,
         };
         const confirmLongScore = Object.values(confirmLongItems).filter(Boolean).length;
 
@@ -510,7 +540,7 @@ app.get("/api/screener", async (req, res) => {
           macdDown,
           bbExpandingDown: bbExpanding && bb && price <= bb.middle,
           volPulseOk: volPulse > 1.1,
-          vwapOk: vwapDevPct != null && vwapDevPct < 2.0 && vwapDevPct > -5.0,
+          vwapOk: vwapDevPct != null && vwapDevPct < 1.5 && vwapDevPct > -3.0,
         };
         const confirmShortScore = Object.values(confirmShortItems).filter(Boolean).length;
 
@@ -525,33 +555,35 @@ app.get("/api/screener", async (req, res) => {
           stage = "confirm";
           score = confirmLongScore;
           techSummary = [
-            `${trendLongOk ? "✅" : "❌"} 趨勢：EMA20>EMA50 + 價格在 EMA20 上`,
-            `${rsiPullbackLong ? "✅" : "❌"} RSI 回落（45~58）`,
+            `${trendLongOk ? "✅" : "❌"} 趨勢：EMA20>EMA50 且 價格在 EMA20 上`,
+            `${rsiPullbackLong ? "✅" : "❌"} RSI 回踩（48~55）`,
             `${macdUp ? "✅" : "❌"} MACD 動能轉強/維持正向`,
-            `${bbExpanding ? "✅" : "❌"} BB 不縮/擴張`,
+            `${bbExpanding ? "✅" : "❌"} 布林帶不縮/擴張`,
             `${volPulse > 1.1 ? "✅" : "❌"} 量能脈衝（5/20）`,
+            `${vwapDevPct != null && vwapDevPct > -1.5 && vwapDevPct < 3.0 ? "✅" : "❌"} VWAP 偏離合理`,
           ];
         } else if (confirmShortScore >= CONFIRM_MIN_SCORE) {
           side = "short";
           stage = "confirm";
           score = confirmShortScore;
           techSummary = [
-            `${trendShortOk ? "✅" : "❌"} 趨勢：EMA20<EMA50 + 價格在 EMA20 下`,
-            `${rsiPullbackShort ? "✅" : "❌"} RSI 回抽（42~55）`,
+            `${trendShortOk ? "✅" : "❌"} 趨勢：EMA20<EMA50 且 價格在 EMA20 下`,
+            `${rsiPullbackShort ? "✅" : "❌"} RSI 回抽（45~52）`,
             `${macdDown ? "✅" : "❌"} MACD 動能轉弱/維持負向`,
-            `${bbExpanding ? "✅" : "❌"} BB 不縮/擴張`,
+            `${bbExpanding ? "✅" : "❌"} 布林帶不縮/擴張`,
             `${volPulse > 1.1 ? "✅" : "❌"} 量能脈衝（5/20）`,
+            `${vwapDevPct != null && vwapDevPct < 1.5 && vwapDevPct > -3.0 ? "✅" : "❌"} VWAP 偏離合理`,
           ];
         } else if (watchLongMust && watchLongScore >= WATCH_MIN_SCORE) {
           side = "long";
           stage = "watch";
           score = watchLongScore;
           techSummary = [
-            `🟡 Tier B：趨勢成立但位置可能偏追，建議等回踩/再確認`,
-            `${breakoutUp ? "✅" : "❌"} 可能突破前高`,
+            `🟡 觀察：趨勢成立，但位置可能偏追，建議等回踩/再確認`,
+            `${breakoutUp ? "✅" : "❌"} 可能突破前高（20 根）`,
             `${macdUp ? "✅" : "❌"} MACD 偏強`,
             `${rsiHotLong ? "✅" : "❌"} RSI 偏熱（60~72）`,
-            `${bbExpanding ? "✅" : "❌"} BB 不縮/擴張`,
+            `${bbExpanding ? "✅" : "❌"} 布林帶不縮/擴張`,
             `${volPulse > 1.1 ? "✅" : "❌"} 量能不是死的`,
           ];
         } else if (watchShortMust && watchShortScore >= WATCH_MIN_SCORE) {
@@ -559,29 +591,28 @@ app.get("/api/screener", async (req, res) => {
           stage = "watch";
           score = watchShortScore;
           techSummary = [
-            `🟡 Tier B：趨勢成立但位置可能偏追，建議等反彈/再確認`,
-            `${breakoutDown ? "✅" : "❌"} 可能跌破前低`,
+            `🟡 觀察：趨勢成立，但位置可能偏追，建議等反彈/再確認`,
+            `${breakoutDown ? "✅" : "❌"} 可能跌破前低（20 根）`,
             `${macdDown ? "✅" : "❌"} MACD 偏弱`,
             `${rsiColdShort ? "✅" : "❌"} RSI 偏冷（28~40）`,
-            `${bbExpanding ? "✅" : "❌"} BB 不縮/擴張`,
+            `${bbExpanding ? "✅" : "❌"} 布林帶不縮/擴張`,
             `${volPulse > 1.1 ? "✅" : "❌"} 量能不是死的`,
           ];
         }
 
         if (!side || !stage) continue;
 
-        // Apply filters (stage/side)
+        // filters
         if (stageFilter !== "all" && stage !== stageFilter) continue;
         if (sideFilter !== "all" && side !== sideFilter) continue;
 
-        // strength 1~5
         const strength = Math.max(1, Math.min(5, Math.round((score / scoreMax) * 5)));
 
         const holdHours = 6;
         const signalTime = last.time;
         const exitBy = new Date(new Date(signalTime).getTime() + holdHours * 60 * 60 * 1000).toISOString();
 
-        // risk model (保留你的調性)
+        // 風控（保留你原本調性）
         const basePrice = price;
         let stop, target, riskPct, rewardPct;
 
@@ -625,7 +656,7 @@ app.get("/api/screener", async (req, res) => {
           scoreMax,
           lastPrice: basePrice,
           time: last.time,
-          entry: basePrice, // 先用 lastPrice 當 entry（前端可自行調整）
+          entry: basePrice,
           stop,
           target,
           riskPct,
@@ -638,7 +669,6 @@ app.get("/api/screener", async (req, res) => {
           techSummary,
         });
 
-        // 快速收斂：如果你有設 maxSignals，達標就不要再掃太久
         if (signals.length >= maxSignals) break;
       } catch (err) {
         if (includeErrors) {
@@ -654,7 +684,7 @@ app.get("/api/screener", async (req, res) => {
     if (signals.length >= maxSignals) break;
   }
 
-  // sorting: confirm first, then strength, then score
+  // confirm first, then strength, then score
   signals.sort((a, b) => {
     const aRank = a.stage === "confirm" ? 0 : 1;
     const bRank = b.stage === "confirm" ? 0 : 1;
@@ -665,7 +695,7 @@ app.get("/api/screener", async (req, res) => {
   });
 
   res.json({
-    mode: `tierA-confirm + tierB-watch (1h/6h, top${top} USDT by vol)`,
+    mode: `TierA確認 + TierB觀察（1h/6h，Top${top} 交易量，排除穩定幣）`,
     generatedAt: new Date().toISOString(),
     durationMs: Date.now() - started,
     params: {
@@ -685,6 +715,6 @@ app.get("/api/screener", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log("🚀 Screener backend running");
+  console.log("🚀 KuCoin Screener backend running");
   console.log(`✅ http://localhost:${PORT}`);
 });
