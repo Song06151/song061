@@ -1,7 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
-const STORAGE_KEY = "kucoin_screener_sim_positions_v2";
+const STORAGE_KEY = "kucoin_screener_sim_positions_locked_v1";
 const DEFAULT_API_BASE = "https://kucoin-screener-backend.onrender.com";
+
+// ✅ 固定模擬單規格（你要求鎖死）
+const FIXED_MARGIN_USDT = 100;
+const FIXED_LEVERAGE = 10;
 
 const styles = {
   page: {
@@ -70,10 +74,12 @@ const styles = {
 
   badge: (kind) => {
     const map = {
-      confirm: { bg: "rgba(34,197,94,0.18)", bd: "rgba(34,197,94,0.35)" },
-      watch: { bg: "rgba(251,191,36,0.18)", bd: "rgba(251,191,36,0.35)" },
-      long: { bg: "rgba(59,130,246,0.18)", bd: "rgba(59,130,246,0.35)" },
-      short: { bg: "rgba(239,68,68,0.18)", bd: "rgba(239,68,68,0.35)" },
+      confirm: { bg: "rgba(34,197,94,0.18)", bd: "rgba(34,197,94,0.35)" }, // 可進場
+      watch: { bg: "rgba(251,191,36,0.18)", bd: "rgba(251,191,36,0.35)" }, // 觀察
+      long: { bg: "rgba(59,130,246,0.18)", bd: "rgba(59,130,246,0.35)" },   // 做多
+      short: { bg: "rgba(239,68,68,0.18)", bd: "rgba(239,68,68,0.35)" },   // 做空
+      open: { bg: "rgba(34,197,94,0.18)", bd: "rgba(34,197,94,0.35)" },
+      closed: { bg: "rgba(251,191,36,0.18)", bd: "rgba(251,191,36,0.35)" },
     };
     const v = map[kind] || { bg: "rgba(255,255,255,0.10)", bd: "rgba(255,255,255,0.18)" };
     return {
@@ -124,6 +130,12 @@ function fmt(n, dp = 6) {
   return x.toFixed(dp);
 }
 
+function fmt2(n) {
+  const x = safeNumber(n);
+  if (x == null) return "-";
+  return x.toFixed(2);
+}
+
 function fmtPct(n, dp = 2) {
   const x = safeNumber(n);
   if (x == null) return "-";
@@ -149,7 +161,7 @@ function savePositions(list) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
 }
 
-// 粗略 PnL（夠用）
+// 粗略損益（足夠用）
 function calcPnL({ side, entryPrice, markPrice, marginUSDT, leverage }) {
   const e = safeNumber(entryPrice);
   const m = safeNumber(markPrice);
@@ -168,7 +180,6 @@ function buildScreenerUrl(apiBase, filters) {
   const base = apiBase.replace(/\/$/, "");
   const p = new URLSearchParams();
 
-  // 只把「需要」的 filter 帶給後端，讓 payload 更小
   if (filters.timeframe && filters.timeframe !== "all") p.set("timeframe", filters.timeframe);
   if (filters.stage && filters.stage !== "all") p.set("stage", filters.stage);
   if (filters.side && filters.side !== "all") p.set("side", filters.side);
@@ -183,8 +194,14 @@ function buildScreenerUrl(apiBase, filters) {
   return `${base}/api/screener?${p.toString()}`;
 }
 
+function stageLabel(stage) {
+  return stage === "confirm" ? "可進場" : "觀察中";
+}
+function sideLabel(side) {
+  return side === "long" ? "做多" : "做空";
+}
+
 function SignalCard({ s, onAddSim, expanded, onToggleExpanded }) {
-  const stageLabel = s.stage === "confirm" ? "Tier A" : "Tier B";
   return (
     <div style={styles.signalCard}>
       <div style={styles.signalHeader}>
@@ -197,8 +214,8 @@ function SignalCard({ s, onAddSim, expanded, onToggleExpanded }) {
 
         <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end" }}>
           <div style={styles.row}>
-            <span style={styles.badge(s.stage)}>{stageLabel}</span>
-            <span style={styles.badge(s.side)}>{String(s.side || "").toUpperCase()}</span>
+            <span style={styles.badge(s.stage)}>{stageLabel(s.stage)}</span>
+            <span style={styles.badge(s.side)}>{sideLabel(s.side)}</span>
           </div>
           <button style={styles.btn("muted")} onClick={onToggleExpanded}>
             {expanded ? "收合" : "展開"}
@@ -208,31 +225,33 @@ function SignalCard({ s, onAddSim, expanded, onToggleExpanded }) {
 
       <div style={styles.kv}>
         <div>
-          <div style={styles.small}>Score</div>
-          <div style={{ fontWeight: 900 }}>{s.score}/{s.scoreMax} • strength {s.strength ?? "-"}</div>
+          <div style={styles.small}>條件符合</div>
+          <div style={{ fontWeight: 900 }}>
+            {s.score}/{s.scoreMax} • 強度 {s.strength ?? "-"}
+          </div>
         </div>
         <div>
-          <div style={styles.small}>Price</div>
+          <div style={styles.small}>現價</div>
           <div style={{ fontWeight: 900 }}>{fmt(s.lastPrice, 6)}</div>
         </div>
         <div>
-          <div style={styles.small}>Entry / SL / TP</div>
+          <div style={styles.small}>進場 / 停損 / 停利</div>
           <div style={{ fontWeight: 900, fontSize: 13 }}>
             {fmt(s.entry, 6)} / {fmt(s.stop, 6)} / {fmt(s.target, 6)}
           </div>
         </div>
         <div>
-          <div style={styles.small}>RR / VWAP dev</div>
+          <div style={styles.small}>風報比 / 偏離VWAP</div>
           <div style={{ fontWeight: 900, fontSize: 13 }}>
-            {fmt(s.rr, 2)} • {fmtPct(s.vwapDevPct, 2)}
+            {fmt2(s.rr)} • {fmtPct(s.vwapDevPct, 2)}
           </div>
         </div>
       </div>
 
       <div style={{ marginTop: 10, ...styles.row }}>
-        <button style={styles.btn("primary")} onClick={() => onAddSim(s, null)}>+ 模擬單</button>
-        <button style={styles.btn("muted")} onClick={() => onAddSim(s, "long")}>+ Long</button>
-        <button style={styles.btn("muted")} onClick={() => onAddSim(s, "short")}>+ Short</button>
+        <button style={styles.btn("primary")} onClick={() => onAddSim(s)}>
+          ＋建立模擬單
+        </button>
       </div>
 
       {expanded ? (
@@ -243,7 +262,7 @@ function SignalCard({ s, onAddSim, expanded, onToggleExpanded }) {
               <div key={i}>• {t}</div>
             ))}
             <div style={{ marginTop: 8, opacity: 0.75 }}>
-              exitBy: <span style={styles.mono}>{s.exitBy}</span>
+              建議最晚出場時間：<span style={styles.mono}>{s.exitBy}</span>
             </div>
           </div>
         </>
@@ -255,17 +274,18 @@ function SignalCard({ s, onAddSim, expanded, onToggleExpanded }) {
 export default function KuCoinStrategyScreener() {
   const [apiBase, setApiBase] = useState(DEFAULT_API_BASE);
 
-  // ✅ filters（會帶去後端）
+  // filters
   const [timeframe, setTimeframe] = useState("all"); // all | 1h | 6h | 1h,6h
-  const [stage, setStage] = useState("all");         // all | confirm | watch
+  const [stage, setStage] = useState("confirm");     // ✅ 預設直接只看可進場
   const [side, setSide] = useState("all");           // all | long | short
   const [symbol, setSymbol] = useState("");
 
-  const [top, setTop] = useState(80);
+  // ✅ 你要 Top 50
+  const [top, setTop] = useState(50);
   const [minBars, setMinBars] = useState(60);
   const [limit, setLimit] = useState(500);
-  const [maxSignals, setMaxSignals] = useState(200);
-  const [includeErrors, setIncludeErrors] = useState(true);
+  const [maxSignals, setMaxSignals] = useState(120);
+  const [includeErrors, setIncludeErrors] = useState(false); // ✅ 預設關掉，避免洗
 
   const [refreshSec, setRefreshSec] = useState(60);
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -278,13 +298,9 @@ export default function KuCoinStrategyScreener() {
 
   // 展開狀態
   const [expandedMap, setExpandedMap] = useState({});
-  const toggleExpanded = (key) =>
-    setExpandedMap((m) => ({ ...m, [key]: !m[key] }));
+  const toggleExpanded = (key) => setExpandedMap((m) => ({ ...m, [key]: !m[key] }));
 
   const timerRef = useRef(null);
-
-  // ✅ 一鍵「只看 Tier A」
-  const tierAOnly = stage === "confirm";
 
   async function fetchScreener() {
     setLoading(true);
@@ -338,7 +354,7 @@ export default function KuCoinStrategyScreener() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoRefresh, refreshSec, apiBase, timeframe, stage, side, symbol, top, minBars, limit, maxSignals, includeErrors]);
 
-  // signals 更新時同步更新模擬單 mark price
+  // signals 更新時：同步更新模擬單 mark / pnl
   useEffect(() => {
     if (!Array.isArray(data.signals) || data.signals.length === 0) return;
 
@@ -372,13 +388,18 @@ export default function KuCoinStrategyScreener() {
   const tierA = useMemo(() => (data.signals || []).filter((x) => x.stage === "confirm"), [data.signals]);
   const tierB = useMemo(() => (data.signals || []).filter((x) => x.stage === "watch"), [data.signals]);
 
-  function addPositionFromSignal(sig, forcedSide = null) {
-    const sSide = forcedSide || sig.side;
+  // ✅ 模擬單：總持倉盈虧 + 總報酬率（以保證金加權）
+  const simSummary = useMemo(() => {
+    const open = positions.filter((p) => p.status === "open");
+    const totalMargin = open.reduce((s, p) => s + (safeNumber(p.marginUSDT) || 0), 0);
+    const totalPnl = open.reduce((s, p) => s + (safeNumber(p.pnl) || 0), 0);
+    const roi = totalMargin > 0 ? (totalPnl / totalMargin) * 100 : 0;
+    return { openCount: open.length, totalMargin, totalPnl, roi };
+  }, [positions]);
+
+  function addPositionFromSignal(sig) {
     const entryPrice = safeNumber(sig.lastPrice) ?? safeNumber(sig.entry) ?? null;
     if (!sig?.symbol || entryPrice == null) return;
-
-    const marginUSDT = 100;
-    const leverage = 10;
 
     const pos = {
       id: makeId(),
@@ -387,15 +408,14 @@ export default function KuCoinStrategyScreener() {
       symbol: sig.symbol,
       timeframe: sig.timeframe,
       stage: sig.stage,
-      side: sSide,
-      marginUSDT,
-      leverage,
-      entryPrice,
+      side: sig.side, // 以訊號方向為準
+      marginUSDT: FIXED_MARGIN_USDT, // ✅ 鎖死
+      leverage: FIXED_LEVERAGE,       // ✅ 鎖死
+      entryPrice,                    // ✅ 以建立當下進場價為準（鎖死）
       markPrice: entryPrice,
       pnl: 0,
       pnlPct: 0,
-      note: `from ${sig.stage}/${sig.timeframe}`,
-      status: "open",
+      status: "open", // open | closed
       closePrice: null,
       realizedPnl: null,
       realizedPnlPct: null,
@@ -441,30 +461,23 @@ export default function KuCoinStrategyScreener() {
     savePositions(next);
   }
 
-  function updatePositionField(id, patch) {
-    const next = positions.map((p) => (p.id === id ? { ...p, ...patch, updatedAt: new Date().toISOString() } : p));
-    setPositions(next);
-    savePositions(next);
-  }
-
   return (
     <div style={styles.page}>
       <div style={styles.topGrid}>
-        {/* Left: header & filters */}
+        {/* 左：控制與篩選 */}
         <div style={styles.card}>
           <div style={styles.row}>
-
             <div style={{ flex: "1 1 280px" }}>
-              <h1 style={styles.title}>KuCoin Strategy Screener</h1>
+              <h1 style={styles.title}>KuCoin 策略掃描器</h1>
               <div style={styles.sub}>
                 {data.mode || "—"}{" "}
                 <span style={{ opacity: 0.6 }}>•</span>{" "}
-                Tier A: <b>{tierA.length}</b>{" "}
+                可進場：<b>{tierA.length}</b>{" "}
                 <span style={{ opacity: 0.6 }}>•</span>{" "}
-                Tier B: <b>{tierB.length}</b>{" "}
+                觀察：<b>{tierB.length}</b>{" "}
                 <span style={{ opacity: 0.6 }}>•</span>{" "}
                 <span style={styles.mono}>{data.generatedAt || "-"}</span>{" "}
-                ({data.durationMs ? `${data.durationMs}ms` : "-"})
+                （{data.durationMs ? `${data.durationMs}ms` : "-"}）
               </div>
             </div>
 
@@ -473,7 +486,7 @@ export default function KuCoinStrategyScreener() {
                 {loading ? "更新中..." : "手動刷新"}
               </button>
               <button style={styles.btn(autoRefresh ? "ok" : "muted")} onClick={() => setAutoRefresh((v) => !v)}>
-                自動刷新：{autoRefresh ? "ON" : "OFF"}
+                自動刷新：{autoRefresh ? "開" : "關"}
               </button>
             </div>
           </div>
@@ -482,7 +495,7 @@ export default function KuCoinStrategyScreener() {
 
           <div style={styles.row}>
             <div style={{ minWidth: 260, flex: "1 1 360px" }}>
-              <div style={styles.label}>API Base</div>
+              <div style={styles.label}>後端 API</div>
               <input
                 style={styles.input}
                 value={apiBase}
@@ -492,9 +505,9 @@ export default function KuCoinStrategyScreener() {
             </div>
 
             <div>
-              <div style={styles.label}>Refresh (sec)</div>
+              <div style={styles.label}>自動刷新（秒）</div>
               <input
-                style={{ ...styles.input, width: 130 }}
+                style={{ ...styles.input, width: 140 }}
                 type="number"
                 min={5}
                 value={refreshSec}
@@ -507,44 +520,44 @@ export default function KuCoinStrategyScreener() {
 
           <div style={styles.row}>
             <div>
-              <div style={styles.label}>Timeframe</div>
+              <div style={styles.label}>週期</div>
               <select style={styles.select} value={timeframe} onChange={(e) => setTimeframe(e.target.value)}>
-                <option value="all">All</option>
-                <option value="1h">1h</option>
-                <option value="6h">6h</option>
+                <option value="all">全部</option>
+                <option value="1h">1 小時</option>
+                <option value="6h">6 小時</option>
                 <option value="1h,6h">1h + 6h</option>
               </select>
             </div>
 
             <div>
-              <div style={styles.label}>Stage</div>
+              <div style={styles.label}>訊號等級</div>
               <select style={styles.select} value={stage} onChange={(e) => setStage(e.target.value)}>
-                <option value="all">All</option>
-                <option value="confirm">Tier A (Confirm)</option>
-                <option value="watch">Tier B (Watch)</option>
+                <option value="all">全部</option>
+                <option value="confirm">可進場（Tier A）</option>
+                <option value="watch">觀察中（Tier B）</option>
               </select>
             </div>
 
             <div>
-              <div style={styles.label}>Side</div>
+              <div style={styles.label}>方向</div>
               <select style={styles.select} value={side} onChange={(e) => setSide(e.target.value)}>
-                <option value="all">All</option>
-                <option value="long">Long</option>
-                <option value="short">Short</option>
+                <option value="all">全部</option>
+                <option value="long">做多</option>
+                <option value="short">做空</option>
               </select>
             </div>
 
             <div style={{ flex: "1 1 220px" }}>
-              <div style={styles.label}>Symbol contains</div>
+              <div style={styles.label}>幣種關鍵字</div>
               <input style={styles.input} value={symbol} onChange={(e) => setSymbol(e.target.value)} placeholder="BTC / ETH / SOL..." />
             </div>
 
             <button
-              style={styles.btn(tierAOnly ? "ok" : "muted")}
+              style={styles.btn(stage === "confirm" ? "ok" : "muted")}
               onClick={() => setStage((s) => (s === "confirm" ? "all" : "confirm"))}
-              title="一鍵只看 Tier A"
+              title="一鍵只看可進場"
             >
-              只看 Tier A：{tierAOnly ? "ON" : "OFF"}
+              只看可進場：{stage === "confirm" ? "開" : "關"}
             </button>
           </div>
 
@@ -552,23 +565,23 @@ export default function KuCoinStrategyScreener() {
 
           <div style={styles.row}>
             <div>
-              <div style={styles.label}>Top</div>
-              <input style={{ ...styles.input, width: 120 }} type="number" min={1} max={200} value={top} onChange={(e) => setTop(Number(e.target.value))} />
+              <div style={styles.label}>掃描幣種數（Top）</div>
+              <input style={{ ...styles.input, width: 140 }} type="number" min={1} max={200} value={top} onChange={(e) => setTop(Number(e.target.value))} />
             </div>
             <div>
-              <div style={styles.label}>minBars</div>
-              <input style={{ ...styles.input, width: 120 }} type="number" min={30} max={500} value={minBars} onChange={(e) => setMinBars(Number(e.target.value))} />
+              <div style={styles.label}>最少 K 線數（minBars）</div>
+              <input style={{ ...styles.input, width: 160 }} type="number" min={30} max={500} value={minBars} onChange={(e) => setMinBars(Number(e.target.value))} />
             </div>
             <div>
-              <div style={styles.label}>limit</div>
-              <input style={{ ...styles.input, width: 120 }} type="number" min={50} max={1500} value={limit} onChange={(e) => setLimit(Number(e.target.value))} />
+              <div style={styles.label}>K 線抓取上限（limit）</div>
+              <input style={{ ...styles.input, width: 160 }} type="number" min={80} max={1500} value={limit} onChange={(e) => setLimit(Number(e.target.value))} />
             </div>
             <div>
-              <div style={styles.label}>maxSignals</div>
-              <input style={{ ...styles.input, width: 140 }} type="number" min={10} max={2000} value={maxSignals} onChange={(e) => setMaxSignals(Number(e.target.value))} />
+              <div style={styles.label}>最大回傳訊號（maxSignals）</div>
+              <input style={{ ...styles.input, width: 180 }} type="number" min={10} max={2000} value={maxSignals} onChange={(e) => setMaxSignals(Number(e.target.value))} />
             </div>
             <button style={styles.btn(includeErrors ? "warn" : "muted")} onClick={() => setIncludeErrors((v) => !v)}>
-              errors：{includeErrors ? "ON" : "OFF"}
+              顯示錯誤：{includeErrors ? "開" : "關"}
             </button>
           </div>
 
@@ -582,13 +595,22 @@ export default function KuCoinStrategyScreener() {
           ) : null}
         </div>
 
-        {/* Right: sim positions */}
+        {/* 右：模擬單（鎖定版） */}
         <div style={styles.card}>
           <div style={styles.row}>
             <div style={{ fontWeight: 950 }}>模擬單（{positions.length}）</div>
             <div style={{ fontSize: 12, opacity: 0.75 }}>
-              預設：100 USDT / 槓桿 10，刷新會更新未實現損益（粗略）
+              固定：每單 {FIXED_MARGIN_USDT} USDT / 槓桿 {FIXED_LEVERAGE} 倍（不可修改）
             </div>
+          </div>
+
+          <div style={{ marginTop: 8, fontSize: 12, opacity: 0.85 }}>
+            目前持倉（OPEN）：
+            <b> {simSummary.openCount} </b>單　
+            持倉盈虧：
+            <b> {fmt2(simSummary.totalPnl)} USDT </b>　
+            報酬率：
+            <b> {fmtPct(simSummary.roi, 2)} </b>
           </div>
 
           <div style={styles.divider} />
@@ -597,25 +619,26 @@ export default function KuCoinStrategyScreener() {
             <table style={styles.table}>
               <thead>
                 <tr>
-                  <th style={styles.th}>Status</th>
-                  <th style={styles.th}>Symbol</th>
-                  <th style={styles.th}>Side</th>
-                  <th style={styles.th}>Margin / Lev</th>
-                  <th style={styles.th}>Entry</th>
-                  <th style={styles.th}>Mark</th>
-                  <th style={styles.th}>PnL</th>
-                  <th style={styles.th}>Actions</th>
+                  <th style={styles.th}>狀態</th>
+                  <th style={styles.th}>幣種</th>
+                  <th style={styles.th}>方向</th>
+                  <th style={styles.th}>保證金/槓桿</th>
+                  <th style={styles.th}>進場價</th>
+                  <th style={styles.th}>現價</th>
+                  <th style={styles.th}>持倉盈虧</th>
+                  <th style={styles.th}>目前報酬率</th>
+                  <th style={styles.th}>操作</th>
                 </tr>
               </thead>
               <tbody>
                 {positions.map((p) => (
                   <tr key={p.id}>
                     <td style={styles.td}>
-                      <span style={styles.badge(p.status === "closed" ? "watch" : "confirm")}>
-                        {p.status === "closed" ? "CLOSED" : "OPEN"}
+                      <span style={styles.badge(p.status === "open" ? "open" : "closed")}>
+                        {p.status === "open" ? "持倉中" : "已平倉"}
                       </span>
                       <div style={{ marginTop: 6, ...styles.small }}>
-                        <span style={styles.mono}>{p.stage}/{p.timeframe}</span>
+                        <span style={styles.mono}>{stageLabel(p.stage)}/{p.timeframe}</span>
                       </div>
                     </td>
 
@@ -625,42 +648,19 @@ export default function KuCoinStrategyScreener() {
                     </td>
 
                     <td style={styles.td}>
-                      <span style={styles.badge(p.side)}>{String(p.side || "").toUpperCase()}</span>
+                      <span style={styles.badge(p.side)}>{sideLabel(p.side)}</span>
                     </td>
 
                     <td style={styles.td}>
-                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                        <input
-                          style={{ ...styles.input, width: 110 }}
-                          type="number"
-                          min={1}
-                          value={p.marginUSDT}
-                          disabled={p.status === "closed"}
-                          onChange={(e) => updatePositionField(p.id, { marginUSDT: Number(e.target.value) })}
-                          title="保證金（USDT）"
-                        />
-                        <input
-                          style={{ ...styles.input, width: 90 }}
-                          type="number"
-                          min={1}
-                          value={p.leverage}
-                          disabled={p.status === "closed"}
-                          onChange={(e) => updatePositionField(p.id, { leverage: Number(e.target.value) })}
-                          title="槓桿"
-                        />
+                      <div style={{ fontWeight: 900 }}>
+                        {FIXED_MARGIN_USDT} / {FIXED_LEVERAGE}x
                       </div>
+                      <div style={styles.small}>（已鎖定）</div>
                     </td>
 
                     <td style={styles.td}>
-                      <input
-                        style={{ ...styles.input, width: 150 }}
-                        type="number"
-                        step="0.0000001"
-                        value={p.entryPrice}
-                        disabled={p.status === "closed"}
-                        onChange={(e) => updatePositionField(p.id, { entryPrice: Number(e.target.value) })}
-                        title="進場價（可手動改）"
-                      />
+                      <div style={{ fontWeight: 900 }}>{fmt(p.entryPrice, 6)}</div>
+                      <div style={styles.small}>（已鎖定）</div>
                     </td>
 
                     <td style={styles.td}>
@@ -670,15 +670,17 @@ export default function KuCoinStrategyScreener() {
 
                     <td style={styles.td}>
                       {p.status === "closed" ? (
-                        <>
-                          <div style={{ fontWeight: 950 }}>{fmt(p.realizedPnl, 2)} USDT</div>
-                          <div style={styles.small}>{fmtPct(p.realizedPnlPct, 2)}</div>
-                        </>
+                        <div style={{ fontWeight: 950 }}>{fmt2(p.realizedPnl)} USDT</div>
                       ) : (
-                        <>
-                          <div style={{ fontWeight: 950 }}>{fmt(p.pnl, 2)} USDT</div>
-                          <div style={styles.small}>{fmtPct(p.pnlPct, 2)}</div>
-                        </>
+                        <div style={{ fontWeight: 950 }}>{fmt2(p.pnl)} USDT</div>
+                      )}
+                    </td>
+
+                    <td style={styles.td}>
+                      {p.status === "closed" ? (
+                        <div style={{ fontWeight: 950 }}>{fmtPct(p.realizedPnlPct, 2)}</div>
+                      ) : (
+                        <div style={{ fontWeight: 950 }}>{fmtPct(p.pnlPct, 2)}</div>
                       )}
                     </td>
 
@@ -699,8 +701,8 @@ export default function KuCoinStrategyScreener() {
 
                 {positions.length === 0 ? (
                   <tr>
-                    <td style={styles.td} colSpan={8}>
-                      <div style={{ opacity: 0.8 }}>目前沒有模擬單。從 Tier A / Tier B 訊號卡片一鍵建立。</div>
+                    <td style={styles.td} colSpan={9}>
+                      <div style={{ opacity: 0.8 }}>目前沒有模擬單。從「可進場」卡片點「＋建立模擬單」即可。</div>
                     </td>
                   </tr>
                 ) : null}
@@ -710,13 +712,15 @@ export default function KuCoinStrategyScreener() {
         </div>
       </div>
 
-      {/* Signals sections */}
+      {/* 訊號區 */}
       <div style={{ height: 12 }} />
 
       <div style={styles.card}>
         <div style={styles.row}>
-          <div style={styles.sectionTitle}>Tier A（Confirm）</div>
-          <div style={{ fontSize: 12, opacity: 0.75 }}>比較適合當作「可開模擬單」的進場候選</div>
+          <div style={styles.sectionTitle}>可進場（Tier A）</div>
+          <div style={{ fontSize: 12, opacity: 0.75 }}>
+            這裡是「比較像真的可以挑來開單」的候選（已提高嚴苛度）
+          </div>
         </div>
 
         <div style={{ height: 10 }} />
@@ -737,14 +741,17 @@ export default function KuCoinStrategyScreener() {
             })}
           </div>
         ) : (
-          <div style={{ opacity: 0.8 }}>目前 Tier A 沒有訊號（你可以把 stage 改回 All 或調低 minBars）。</div>
+          <div style={{ opacity: 0.8 }}>
+            目前沒有可進場訊號。你可以：
+            <span style={styles.mono}> 放寬 minBars</span> 或改成 <span style={styles.mono}>全部</span> 看看。
+          </div>
         )}
 
         <div style={styles.divider} />
 
         <div style={styles.row}>
-          <div style={styles.sectionTitle}>Tier B（Watch）</div>
-          <div style={{ fontSize: 12, opacity: 0.75 }}>趨勢成立，但位置可能偏追，主要當提醒用</div>
+          <div style={styles.sectionTitle}>觀察中（Tier B）</div>
+          <div style={{ fontSize: 12, opacity: 0.75 }}>趨勢成立但位置可能偏追，當提醒用</div>
         </div>
 
         <div style={{ height: 10 }} />
@@ -765,32 +772,34 @@ export default function KuCoinStrategyScreener() {
             })}
           </div>
         ) : (
-          <div style={{ opacity: 0.8 }}>目前 Tier B 沒有訊號。</div>
+          <div style={{ opacity: 0.8 }}>目前沒有觀察訊號。</div>
         )}
       </div>
 
-      {/* Errors */}
+      {/* 錯誤區 */}
       <div style={{ height: 12 }} />
 
       <div style={styles.card}>
         <div style={styles.row}>
-          <div style={styles.sectionTitle}>Errors（{(data.errors || []).length}）</div>
-          <div style={{ fontSize: 12, opacity: 0.75 }}>若你覺得洗版，就把 errors 關掉或調低 minBars</div>
+          <div style={styles.sectionTitle}>錯誤紀錄（{(data.errors || []).length}）</div>
+          <div style={{ fontSize: 12, opacity: 0.75 }}>
+            如果你不想看，關掉「顯示錯誤」就不會回傳
+          </div>
         </div>
 
         <div style={styles.divider} />
 
         {!includeErrors ? (
-          <div style={{ opacity: 0.8 }}>你已關閉 errors（includeErrors=0）。</div>
+          <div style={{ opacity: 0.8 }}>你已關閉錯誤顯示。</div>
         ) : (
           <div style={{ overflowX: "auto" }}>
             <table style={styles.table}>
               <thead>
                 <tr>
-                  <th style={styles.th}>Symbol</th>
-                  <th style={styles.th}>TF</th>
-                  <th style={styles.th}>Source</th>
-                  <th style={styles.th}>Message</th>
+                  <th style={styles.th}>幣種</th>
+                  <th style={styles.th}>週期</th>
+                  <th style={styles.th}>來源</th>
+                  <th style={styles.th}>訊息</th>
                 </tr>
               </thead>
               <tbody>
@@ -805,7 +814,7 @@ export default function KuCoinStrategyScreener() {
                 {(data.errors || []).length === 0 ? (
                   <tr>
                     <td style={styles.td} colSpan={4}>
-                      <div style={{ opacity: 0.8 }}>目前沒有 errors。</div>
+                      <div style={{ opacity: 0.8 }}>目前沒有錯誤。</div>
                     </td>
                   </tr>
                 ) : null}
@@ -815,9 +824,9 @@ export default function KuCoinStrategyScreener() {
         )}
       </div>
 
-      <div style={{ height: 20 }} />
+      <div style={{ height: 18 }} />
       <div style={{ opacity: 0.6, fontSize: 12 }}>
-        Tip：想要更快 / 更省流量 → 把 stage 設 confirm、maxSignals 調小、errors 關掉。
+        小提醒：你現在 Top 50 + 排除穩定幣 + Tier A 嚴苛化，訊號密度會更像「真的在挑單」的節奏。
       </div>
     </div>
   );
